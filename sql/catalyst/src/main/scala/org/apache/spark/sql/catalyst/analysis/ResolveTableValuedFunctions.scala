@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.analysis
 
 import java.util.Locale
 
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions.{Alias, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, Range}
 import org.apache.spark.sql.catalyst.rules._
@@ -39,7 +40,7 @@ object ResolveTableValuedFunctions extends Rule[LogicalPlan] {
     def implicitCast(values: Seq[Expression]): Option[Seq[Expression]] = {
       if (args.length == values.length) {
         val casted = values.zip(args).map { case (value, (_, expectedType)) =>
-          TypeCoercion.ImplicitTypeCasts.implicitCast(value, expectedType)
+          TypeCoercion.implicitCast(value, expectedType)
         }
         if (casted.forall(_.isDefined)) {
           return Some(casted.map(_.get))
@@ -68,9 +69,11 @@ object ResolveTableValuedFunctions extends Rule[LogicalPlan] {
       : (ArgumentList, Seq[Any] => LogicalPlan) = {
     (ArgumentList(args: _*),
      pf orElse {
-       case args =>
-         throw new IllegalArgumentException(
-           "Invalid arguments for resolved function: " + args.mkString(", "))
+       case arguments =>
+         // This is caught again by the apply function and rethrow with richer information about
+         // position, etc, for a better error message.
+         throw new AnalysisException(
+           "Invalid arguments for resolved function: " + arguments.mkString(", "))
      })
   }
 
@@ -103,27 +106,40 @@ object ResolveTableValuedFunctions extends Rule[LogicalPlan] {
       })
   )
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan transformUp {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
     case u: UnresolvedTableValuedFunction if u.functionArgs.forall(_.resolved) =>
-      val resolvedFunc = builtinFunctions.get(u.functionName.toLowerCase(Locale.ROOT)) match {
+      // The whole resolution is somewhat difficult to understand here due to too much abstractions.
+      // We should probably rewrite the following at some point. Reynold was just here to improve
+      // error messages and didn't have time to do a proper rewrite.
+      val resolvedFunc = builtinFunctions.get(u.name.funcName.toLowerCase(Locale.ROOT)) match {
         case Some(tvf) =>
+
+          def failAnalysis(): Nothing = {
+            val argTypes = u.functionArgs.map(_.dataType.typeName).mkString(", ")
+            u.failAnalysis(
+              s"""error: table-valued function ${u.name} with alternatives:
+                 |${tvf.keys.map(_.toString).toSeq.sorted.map(x => s" ($x)").mkString("\n")}
+                 |cannot be applied to: ($argTypes)""".stripMargin)
+          }
+
           val resolved = tvf.flatMap { case (argList, resolver) =>
             argList.implicitCast(u.functionArgs) match {
               case Some(casted) =>
-                Some(resolver(casted.map(_.eval())))
+                try {
+                  Some(resolver(casted.map(_.eval())))
+                } catch {
+                  case e: AnalysisException =>
+                    failAnalysis()
+                }
               case _ =>
                 None
             }
           }
           resolved.headOption.getOrElse {
-            val argTypes = u.functionArgs.map(_.dataType.typeName).mkString(", ")
-            u.failAnalysis(
-              s"""error: table-valued function ${u.functionName} with alternatives:
-                |${tvf.keys.map(_.toString).toSeq.sorted.map(x => s" ($x)").mkString("\n")}
-                |cannot be applied to: (${argTypes})""".stripMargin)
+            failAnalysis()
           }
         case _ =>
-          u.failAnalysis(s"could not resolve `${u.functionName}` to a table-valued function")
+          u.failAnalysis(s"could not resolve `${u.name}` to a table-valued function")
       }
 
       // If alias names assigned, add `Project` with the aliases
@@ -132,7 +148,7 @@ object ResolveTableValuedFunctions extends Rule[LogicalPlan] {
         // Checks if the number of the aliases is equal to expected one
         if (u.outputNames.size != outputAttrs.size) {
           u.failAnalysis(s"Number of given aliases does not match number of output columns. " +
-            s"Function name: ${u.functionName}; number of aliases: " +
+            s"Function name: ${u.name}; number of aliases: " +
             s"${u.outputNames.size}; number of output columns: ${outputAttrs.size}.")
         }
         val aliases = outputAttrs.zip(u.outputNames).map {

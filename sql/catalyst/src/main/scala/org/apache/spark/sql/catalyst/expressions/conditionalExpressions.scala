@@ -18,8 +18,9 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
+import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion}
 import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.types._
 
 // scalastyle:off line.size.limit
@@ -29,10 +30,17 @@ import org.apache.spark.sql.types._
     Examples:
       > SELECT _FUNC_(1 < 2, 'a', 'b');
        a
-  """)
+  """,
+  since = "1.0.0",
+  group = "conditional_funcs")
 // scalastyle:on line.size.limit
 case class If(predicate: Expression, trueValue: Expression, falseValue: Expression)
-  extends Expression {
+  extends ComplexTypeMergingExpression {
+
+  @transient
+  override lazy val inputTypesForMerging: Seq[DataType] = {
+    Seq(trueValue.dataType, falseValue.dataType)
+  }
 
   override def children: Seq[Expression] = predicate :: trueValue :: falseValue :: Nil
   override def nullable: Boolean = trueValue.nullable || falseValue.nullable
@@ -41,16 +49,14 @@ case class If(predicate: Expression, trueValue: Expression, falseValue: Expressi
     if (predicate.dataType != BooleanType) {
       TypeCheckResult.TypeCheckFailure(
         "type of predicate expression in If should be boolean, " +
-          s"not ${predicate.dataType.simpleString}")
-    } else if (!trueValue.dataType.sameType(falseValue.dataType)) {
+          s"not ${predicate.dataType.catalogString}")
+    } else if (!TypeCoercion.haveSameType(inputTypesForMerging)) {
       TypeCheckResult.TypeCheckFailure(s"differing types in '$sql' " +
-        s"(${trueValue.dataType.simpleString} and ${falseValue.dataType.simpleString}).")
+        s"(${trueValue.dataType.catalogString} and ${falseValue.dataType.catalogString}).")
     } else {
       TypeCheckResult.TypeCheckSuccess
     }
   }
-
-  override def dataType: DataType = trueValue.dataType
 
   override def eval(input: InternalRow): Any = {
     if (java.lang.Boolean.TRUE.equals(predicate.eval(input))) {
@@ -66,7 +72,7 @@ case class If(predicate: Expression, trueValue: Expression, falseValue: Expressi
     val falseEval = falseValue.genCode(ctx)
 
     val code =
-      s"""
+      code"""
          |${condEval.code}
          |boolean ${ev.isNull} = false;
          |${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
@@ -107,28 +113,27 @@ case class If(predicate: Expression, trueValue: Expression, falseValue: Expressi
   examples = """
     Examples:
       > SELECT CASE WHEN 1 > 0 THEN 1 WHEN 2 > 0 THEN 2.0 ELSE 1.2 END;
-       1
+       1.0
       > SELECT CASE WHEN 1 < 0 THEN 1 WHEN 2 > 0 THEN 2.0 ELSE 1.2 END;
-       2
+       2.0
       > SELECT CASE WHEN 1 < 0 THEN 1 WHEN 2 < 0 THEN 2.0 END;
        NULL
-  """)
+  """,
+  since = "1.0.1",
+  group = "conditional_funcs")
 // scalastyle:on line.size.limit
 case class CaseWhen(
     branches: Seq[(Expression, Expression)],
     elseValue: Option[Expression] = None)
-  extends Expression with Serializable {
+  extends ComplexTypeMergingExpression with Serializable {
 
   override def children: Seq[Expression] = branches.flatMap(b => b._1 :: b._2 :: Nil) ++ elseValue
 
   // both then and else expressions should be considered.
-  def valueTypes: Seq[DataType] = branches.map(_._2.dataType) ++ elseValue.map(_.dataType)
-
-  def valueTypesEqual: Boolean = valueTypes.size <= 1 || valueTypes.sliding(2, 1).forall {
-    case Seq(dt1, dt2) => dt1.sameType(dt2)
+  @transient
+  override lazy val inputTypesForMerging: Seq[DataType] = {
+    branches.map(_._2.dataType) ++ elseValue.map(_.dataType)
   }
-
-  override def dataType: DataType = branches.head._2.dataType
 
   override def nullable: Boolean = {
     // Result is nullable if any of the branch is nullable, or if the else value is nullable
@@ -136,8 +141,8 @@ case class CaseWhen(
   }
 
   override def checkInputDataTypes(): TypeCheckResult = {
-    // Make sure all branch conditions are boolean types.
-    if (valueTypesEqual) {
+    if (TypeCoercion.haveSameType(inputTypesForMerging)) {
+      // Make sure all branch conditions are boolean types.
       if (branches.forall(_._1.dataType == BooleanType)) {
         TypeCheckResult.TypeCheckSuccess
       } else {
@@ -147,8 +152,12 @@ case class CaseWhen(
             s"but the ${index + 1}th when expression's type is ${branches(index)._1}")
       }
     } else {
+      val branchesStr = branches.map(_._2.dataType).map(dt => s"WHEN ... THEN ${dt.catalogString}")
+        .mkString(" ")
+      val elseStr = elseValue.map(expr => s" ELSE ${expr.dataType.catalogString}").getOrElse("")
       TypeCheckResult.TypeCheckFailure(
-        "THEN and ELSE expressions should all be same type or coercible to a common type")
+        "THEN and ELSE expressions should all be same type or coercible to a common type," +
+          s" got CASE $branchesStr$elseStr END")
     }
   }
 
@@ -180,7 +189,7 @@ case class CaseWhen(
     "CASE" + cases + elseCase + " END"
   }
 
-  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+  private def multiBranchesCodegen(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     // This variable holds the state of the result:
     // -1 means the condition is not met yet and the result is unknown.
     val NOT_MATCHED = -1
@@ -191,8 +200,9 @@ case class CaseWhen(
     // It is initialized to `NOT_MATCHED`, and if it's set to `HAS_NULL` or `HAS_NONNULL`,
     // We won't go on anymore on the computation.
     val resultState = ctx.freshName("caseWhenResultState")
-    ev.value = GlobalValue(ctx.addMutableState(CodeGenerator.javaType(dataType), ev.value),
-      CodeGenerator.javaType(dataType))
+    ev.value = JavaCode.global(
+      ctx.addMutableState(CodeGenerator.javaType(dataType), ev.value),
+      dataType)
 
     // these blocks are meant to be inside a
     // do {
@@ -264,7 +274,7 @@ case class CaseWhen(
       }.mkString)
 
     ev.copy(code =
-      s"""
+      code"""
          |${CodeGenerator.JAVA_BYTE} $resultState = $NOT_MATCHED;
          |do {
          |  $codes
@@ -272,6 +282,18 @@ case class CaseWhen(
          |// TRUE if any condition is met and the result is null, or no any condition is met.
          |final boolean ${ev.isNull} = ($resultState != $HAS_NONNULL);
        """.stripMargin)
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    if (branches.length == 1) {
+      // If we have only single branch we can use If expression and its codeGen
+      If(
+        branches(0)._1,
+        branches(0)._2,
+        elseValue.getOrElse(Literal.create(null, branches(0)._2.dataType))).doGenCode(ctx, ev)
+    } else {
+      multiBranchesCodegen(ctx, ev)
+    }
   }
 }
 
@@ -292,7 +314,7 @@ object CaseWhen {
       case cond :: value :: Nil => Some((cond, value))
       case value :: Nil => None
     }.toArray.toSeq  // force materialization to make the seq serializable
-    val elseValue = if (branches.size % 2 == 1) Some(branches.last) else None
+    val elseValue = if (branches.size % 2 != 0) Some(branches.last) else None
     CaseWhen(cases, elseValue)
   }
 }
@@ -307,7 +329,7 @@ object CaseKeyWhen {
       case Seq(cond, value) => Some((EqualTo(key, cond), value))
       case Seq(value) => None
     }.toArray.toSeq  // force materialization to make the seq serializable
-    val elseValue = if (branches.size % 2 == 1) Some(branches.last) else None
+    val elseValue = if (branches.size % 2 != 0) Some(branches.last) else None
     CaseWhen(cases, elseValue)
   }
 }

@@ -19,12 +19,12 @@ package org.apache.spark.sql.execution.command
 
 import org.apache.hadoop.conf.Configuration
 
+import org.apache.spark.SparkContext
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.{Command, LogicalPlan}
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
 import org.apache.spark.sql.execution.datasources.BasicWriteJobStatsTracker
-import org.apache.spark.sql.execution.datasources.FileFormatWriter
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.util.SerializableConfiguration
 
@@ -35,14 +35,18 @@ trait DataWritingCommand extends Command {
   /**
    * The input query plan that produces the data to be written.
    * IMPORTANT: the input query plan MUST be analyzed, so that we can carry its output columns
-   *            to [[FileFormatWriter]].
+   *            to [[org.apache.spark.sql.execution.datasources.FileFormatWriter]].
    */
   def query: LogicalPlan
 
   override final def children: Seq[LogicalPlan] = query :: Nil
 
-  // Output columns of the analyzed input query plan
-  def outputColumns: Seq[Attribute]
+  // Output column names of the analyzed input query plan.
+  def outputColumnNames: Seq[String]
+
+  // Output columns of the analyzed input query plan.
+  def outputColumns: Seq[Attribute] =
+    DataWritingCommand.logicalPlanOutputWithNames(query, outputColumnNames)
 
   lazy val metrics: Map[String, SQLMetric] = BasicWriteJobStatsTracker.metrics
 
@@ -52,4 +56,44 @@ trait DataWritingCommand extends Command {
   }
 
   def run(sparkSession: SparkSession, child: SparkPlan): Seq[Row]
+}
+
+object DataWritingCommand {
+  /**
+   * Returns output attributes with provided names.
+   * The length of provided names should be the same of the length of [[LogicalPlan.output]].
+   */
+  def logicalPlanOutputWithNames(
+      query: LogicalPlan,
+      names: Seq[String]): Seq[Attribute] = {
+    // Save the output attributes to a variable to avoid duplicated function calls.
+    val outputAttributes = query.output
+    assert(outputAttributes.length == names.length,
+      "The length of provided names doesn't match the length of output attributes.")
+    outputAttributes.zip(names).map { case (attr, outputName) =>
+      attr.withName(outputName)
+    }
+  }
+
+  /**
+   * When execute CTAS operators, Spark will use [[InsertIntoHadoopFsRelationCommand]]
+   * or [[InsertIntoHiveTable]] command to write data, they both inherit metrics from
+   * [[DataWritingCommand]], but after running [[InsertIntoHadoopFsRelationCommand]]
+   * or [[InsertIntoHiveTable]], we only update metrics in these two command through
+   * [[BasicWriteJobStatsTracker]], we also need to propogate metrics to the command
+   * that actually calls [[InsertIntoHadoopFsRelationCommand]] or [[InsertIntoHiveTable]].
+   *
+   * @param sparkContext Current SparkContext.
+   * @param command Command to execute writing data.
+   * @param metrics Metrics of real DataWritingCommand.
+   */
+  def propogateMetrics(
+      sparkContext: SparkContext,
+      command: DataWritingCommand,
+      metrics: Map[String, SQLMetric]): Unit = {
+    command.metrics.foreach { case (key, metric) => metrics(key).set(metric.value) }
+    SQLMetrics.postDriverMetricUpdates(sparkContext,
+      sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY),
+      metrics.values.toSeq)
+  }
 }

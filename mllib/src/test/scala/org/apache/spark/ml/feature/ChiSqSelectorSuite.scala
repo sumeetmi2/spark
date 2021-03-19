@@ -110,8 +110,7 @@ class ChiSqSelectorSuite extends MLTest with DefaultReadWriteTest {
 
   test("params") {
     ParamsSuite.checkParams(new ChiSqSelector)
-    val model = new ChiSqSelectorModel("myModel",
-      new org.apache.spark.mllib.feature.ChiSqSelectorModel(Array(1, 3, 4)))
+    val model = new ChiSqSelectorModel("myModel", Array(1, 3, 4))
     ParamsSuite.checkParams(model)
   }
 
@@ -125,25 +124,29 @@ class ChiSqSelectorSuite extends MLTest with DefaultReadWriteTest {
   test("Test Chi-Square selector: percentile") {
     val selector = new ChiSqSelector()
       .setOutputCol("filtered").setSelectorType("percentile").setPercentile(0.17)
-    testSelector(selector, dataset)
+    val model = testSelector(selector, dataset)
+    MLTestingUtils.checkCopyAndUids(selector, model)
   }
 
   test("Test Chi-Square selector: fpr") {
     val selector = new ChiSqSelector()
       .setOutputCol("filtered").setSelectorType("fpr").setFpr(0.02)
-    testSelector(selector, dataset)
+    val model = testSelector(selector, dataset)
+    MLTestingUtils.checkCopyAndUids(selector, model)
   }
 
   test("Test Chi-Square selector: fdr") {
     val selector = new ChiSqSelector()
       .setOutputCol("filtered").setSelectorType("fdr").setFdr(0.12)
-    testSelector(selector, dataset)
+    val model = testSelector(selector, dataset)
+    MLTestingUtils.checkCopyAndUids(selector, model)
   }
 
   test("Test Chi-Square selector: fwe") {
     val selector = new ChiSqSelector()
       .setOutputCol("filtered").setSelectorType("fwe").setFwe(0.12)
-    testSelector(selector, dataset)
+    val model = testSelector(selector, dataset)
+    MLTestingUtils.checkCopyAndUids(selector, model)
   }
 
   test("read/write") {
@@ -161,6 +164,17 @@ class ChiSqSelectorSuite extends MLTest with DefaultReadWriteTest {
       css, spark) { (expected, actual) =>
         assert(expected.selectedFeatures === actual.selectedFeatures)
       }
+  }
+
+  test("SPARK-25289: ChiSqSelector should not fail when selecting no features with FDR") {
+    val labeledPoints = (0 to 1).map { n =>
+        val v = Vectors.dense((1 to 3).map(_ => n * 1.0).toArray)
+        (n.toDouble, v)
+      }
+    val inputDF = spark.createDataFrame(labeledPoints).toDF("label", "features")
+    val selector = new ChiSqSelector().setSelectorType("fdr").setFdr(0.05)
+    val model = selector.fit(inputDF)
+    assert(model.selectedFeatures.isEmpty)
   }
 
   private def testSelector(selector: ChiSqSelector, data: Dataset[_]): ChiSqSelectorModel = {

@@ -28,10 +28,10 @@ import org.apache.spark.sql.catalyst.ScalaReflection
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
-abstract class ParquetSchemaTest extends ParquetTest with SharedSQLContext {
+abstract class ParquetSchemaTest extends ParquetTest with SharedSparkSession {
 
   /**
    * Checks whether the reflected Parquet message type for product type `T` conforms `messageType`.
@@ -251,8 +251,27 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     """
       |message root {
       |  optional group _1 (MAP) {
-      |    repeated group map (MAP_KEY_VALUE) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
       |      required int32 key;
+      |      optional binary value (UTF8);
+      |    }
+      |  }
+      |}
+    """.stripMargin,
+    binaryAsString = true,
+    int96AsTimestamp = true,
+    writeLegacyParquetFormat = true)
+
+  testSchemaInference[Tuple1[Map[(String, String), String]]](
+    "map - group type key",
+    """
+      |message root {
+      |  optional group _1 (MAP) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
+      |      required group key {
+      |        optional binary _1 (UTF8);
+      |        optional binary _2 (UTF8);
+      |      }
       |      optional binary value (UTF8);
       |    }
       |  }
@@ -281,7 +300,7 @@ class ParquetSchemaInferenceSuite extends ParquetSchemaTest {
     """
       |message root {
       |  optional group _1 (MAP_KEY_VALUE) {
-      |    repeated group map {
+      |    repeated group key_value {
       |      required int32 key;
       |      optional group value {
       |        optional binary _1 (UTF8);
@@ -427,12 +446,12 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
       assert(errMsg.startsWith("Parquet column cannot be converted in file"))
       val file = errMsg.substring("Parquet column cannot be converted in file ".length,
         errMsg.indexOf(". "))
-      val col = spark.read.parquet(file).schema.fields.filter(_.name.equals("a"))
+      val col = spark.read.parquet(file).schema.fields.filter(_.name == "a")
       assert(col.length == 1)
       if (col(0).dataType == StringType) {
-        assert(errMsg.contains("Column: [a], Expected: IntegerType, Found: BINARY"))
+        assert(errMsg.contains("Column: [a], Expected: int, Found: BINARY"))
       } else {
-        assert(errMsg.endsWith("Column: [a], Expected: StringType, Found: INT32"))
+        assert(errMsg.endsWith("Column: [a], Expected: string, Found: INT32"))
       }
     }
   }
@@ -721,7 +740,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP_KEY_VALUE) {
-      |    repeated group map {
+      |    repeated group key_value {
       |      required int32 num;
       |      required binary str (UTF8);
       |    }
@@ -740,7 +759,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP) {
-      |    repeated group map (MAP_KEY_VALUE) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
       |      required int32 key;
       |      required binary value (UTF8);
       |    }
@@ -778,7 +797,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP_KEY_VALUE) {
-      |    repeated group map {
+      |    repeated group key_value {
       |      required int32 num;
       |      optional binary str (UTF8);
       |    }
@@ -797,7 +816,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP) {
-      |    repeated group map (MAP_KEY_VALUE) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
       |      required int32 key;
       |      optional binary value (UTF8);
       |    }
@@ -838,7 +857,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP) {
-      |    repeated group map (MAP_KEY_VALUE) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
       |      required int32 key;
       |      required binary value (UTF8);
       |    }
@@ -874,7 +893,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         nullable = true))),
     """message root {
       |  optional group f1 (MAP) {
-      |    repeated group map (MAP_KEY_VALUE) {
+      |    repeated group key_value (MAP_KEY_VALUE) {
       |      required int32 key;
       |      optional binary value (UTF8);
       |    }
@@ -1014,19 +1033,21 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
       testName: String,
       parquetSchema: String,
       catalystSchema: StructType,
-      expectedSchema: String): Unit = {
+      expectedSchema: String,
+      caseSensitive: Boolean = true): Unit = {
     testSchemaClipping(testName, parquetSchema, catalystSchema,
-      MessageTypeParser.parseMessageType(expectedSchema))
+      MessageTypeParser.parseMessageType(expectedSchema), caseSensitive)
   }
 
   private def testSchemaClipping(
       testName: String,
       parquetSchema: String,
       catalystSchema: StructType,
-      expectedSchema: MessageType): Unit = {
+      expectedSchema: MessageType,
+      caseSensitive: Boolean): Unit = {
     test(s"Clipping - $testName") {
       val actual = ParquetReadSupport.clipParquetSchema(
-        MessageTypeParser.parseMessageType(parquetSchema), catalystSchema)
+        MessageTypeParser.parseMessageType(parquetSchema), catalystSchema, caseSensitive)
 
       try {
         expectedSchema.checkContains(actual)
@@ -1387,7 +1408,8 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
 
     catalystSchema = new StructType(),
 
-    expectedSchema = ParquetSchemaConverter.EMPTY_MESSAGE)
+    expectedSchema = ParquetSchemaConverter.EMPTY_MESSAGE,
+    caseSensitive = true)
 
   testSchemaClipping(
     "disjoint field sets",
@@ -1425,7 +1447,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
     parquetSchema =
       """message root {
         |  required group f0 (MAP) {
-        |    repeated group map (MAP_KEY_VALUE) {
+        |    repeated group key_value (MAP_KEY_VALUE) {
         |      required int32 key;
         |      required group value {
         |        required int32 value_f0;
@@ -1450,7 +1472,7 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
     expectedSchema =
       """message root {
         |  required group f0 (MAP) {
-        |    repeated group map (MAP_KEY_VALUE) {
+        |    repeated group key_value (MAP_KEY_VALUE) {
         |      required int32 key;
         |      required group value {
         |        required int64 value_f1;
@@ -1544,4 +1566,52 @@ class ParquetSchemaSuite extends ParquetSchemaTest {
         |  }
         |}
       """.stripMargin)
+
+  testSchemaClipping(
+    "case-insensitive resolution: no ambiguity",
+    parquetSchema =
+      """message root {
+        |  required group A {
+        |    optional int32 B;
+        |  }
+        |  optional int32 c;
+        |}
+      """.stripMargin,
+    catalystSchema = {
+      val nestedType = new StructType().add("b", IntegerType, nullable = true)
+      new StructType()
+        .add("a", nestedType, nullable = true)
+        .add("c", IntegerType, nullable = true)
+    },
+    expectedSchema =
+      """message root {
+        |  required group A {
+        |    optional int32 B;
+        |  }
+        |  optional int32 c;
+        |}
+      """.stripMargin,
+    caseSensitive = false)
+
+    test("Clipping - case-insensitive resolution: more than one field is matched") {
+      val parquetSchema =
+        """message root {
+          |  required group A {
+          |    optional int32 B;
+          |  }
+          |  optional int32 c;
+          |  optional int32 a;
+          |}
+        """.stripMargin
+      val catalystSchema = {
+        val nestedType = new StructType().add("b", IntegerType, nullable = true)
+        new StructType()
+          .add("a", nestedType, nullable = true)
+          .add("c", IntegerType, nullable = true)
+      }
+      assertThrows[RuntimeException] {
+        ParquetReadSupport.clipParquetSchema(
+          MessageTypeParser.parseMessageType(parquetSchema), catalystSchema, caseSensitive = false)
+      }
+    }
 }

@@ -21,10 +21,12 @@ import java.util.Locale
 
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
+import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.command.{DDLUtils, RunnableCommand}
+import org.apache.spark.sql.execution.command.ViewHelper.createTemporaryViewRelation
+import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.sql.types._
 
 /**
@@ -68,12 +70,12 @@ case class CreateTempViewUsing(
       s"Temporary view '$tableIdent' should not have specified a database")
   }
 
-  override def argString: String = {
+  override def argString(maxFields: Int): String = {
     s"[tableIdent:$tableIdent " +
       userSpecifiedSchema.map(_ + " ").getOrElse("") +
       s"replace:$replace " +
       s"provider:$provider " +
-      CatalogUtils.maskCredentials(options)
+      conf.redactOptions(options)
   }
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
@@ -89,26 +91,33 @@ case class CreateTempViewUsing(
       options = options)
 
     val catalog = sparkSession.sessionState.catalog
-    val viewDefinition = Dataset.ofRows(
+    val analyzedPlan = Dataset.ofRows(
       sparkSession, LogicalRelation(dataSource.resolveRelation())).logicalPlan
 
     if (global) {
+      val db = sparkSession.sessionState.conf.getConf(StaticSQLConf.GLOBAL_TEMP_DATABASE)
+      val viewIdent = TableIdentifier(tableIdent.table, Option(db))
+      val viewDefinition = createTemporaryViewRelation(
+        viewIdent,
+        sparkSession,
+        replace,
+        catalog.getRawGlobalTempView,
+        originalText = None,
+        analyzedPlan,
+        aliasedPlan = analyzedPlan)
       catalog.createGlobalTempView(tableIdent.table, viewDefinition, replace)
     } else {
+      val viewDefinition = createTemporaryViewRelation(
+        tableIdent,
+        sparkSession,
+        replace,
+        catalog.getRawTempView,
+        originalText = None,
+        analyzedPlan,
+        aliasedPlan = analyzedPlan)
       catalog.createTempView(tableIdent.table, viewDefinition, replace)
     }
 
-    Seq.empty[Row]
-  }
-}
-
-case class RefreshTable(tableIdent: TableIdentifier)
-  extends RunnableCommand {
-
-  override def run(sparkSession: SparkSession): Seq[Row] = {
-    // Refresh the given table's metadata. If this table is cached as an InMemoryRelation,
-    // drop the original cached version and make the new version cached lazily.
-    sparkSession.catalog.refreshTable(tableIdent.quotedString)
     Seq.empty[Row]
   }
 }

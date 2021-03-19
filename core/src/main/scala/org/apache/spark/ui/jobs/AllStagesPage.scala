@@ -30,7 +30,6 @@ import org.apache.spark.ui.{UIUtils, WebUIPage}
 private[ui] class AllStagesPage(parent: StagesTab) extends WebUIPage("") {
   private val sc = parent.sc
   private val subPath = "stages"
-  private def isFairScheduler = parent.isFairScheduler
 
   def render(request: HttpServletRequest): Seq[Node] = {
     // For now, pool information is only accessible in live UIs
@@ -52,12 +51,12 @@ private[ui] class AllStagesPage(parent: StagesTab) extends WebUIPage("") {
 
     val summary: NodeSeq =
       <div>
-        <ul class="unstyled">
+        <ul class="list-unstyled">
           {summaries.flatten}
         </ul>
       </div>
 
-    val poolsDescription = if (sc.isDefined && isFairScheduler) {
+    val poolsDescription = if (parent.isFairScheduler) {
         <span class="collapse-aggregated-poolTable collapse-table"
             onClick="collapseTable('collapse-aggregated-poolTable','aggregated-poolTable')">
           <h4>
@@ -66,7 +65,7 @@ private[ui] class AllStagesPage(parent: StagesTab) extends WebUIPage("") {
           </h4>
         </span> ++
         <div class="aggregated-poolTable collapsible-table">
-          {poolTable.toNodeSeq}
+          {poolTable.toNodeSeq(request)}
         </div>
       } else {
         Seq.empty[Node]
@@ -74,7 +73,7 @@ private[ui] class AllStagesPage(parent: StagesTab) extends WebUIPage("") {
 
     val content = summary ++ poolsDescription ++ tables.flatten.flatten
 
-    UIUtils.headerSparkPage("Stages for All Jobs", content, parent)
+    UIUtils.headerSparkPage(request, "Stages for All Jobs", content, parent)
   }
 
   private def summaryAndTableForStatus(

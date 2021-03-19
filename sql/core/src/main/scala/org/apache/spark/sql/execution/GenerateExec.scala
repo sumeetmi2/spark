@@ -21,9 +21,10 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
+import org.apache.spark.sql.types._
 
 /**
  * For lazy computing, be sure the generator.terminate() called in the very last
@@ -67,7 +68,7 @@ case class GenerateExec(
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
 
-  override def producedAttributes: AttributeSet = AttributeSet(output)
+  override def producedAttributes: AttributeSet = AttributeSet(generatorOutput)
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
 
@@ -95,7 +96,7 @@ case class GenerateExec(
           if (outer && outputRows.isEmpty) {
             joinedRow.withRight(generatorNullRow) :: Nil
           } else {
-            outputRows.map(joinedRow.withRight)
+            outputRows.toIterator.map(joinedRow.withRight)
           }
         } ++ LazyIterator(() => boundGenerator.terminate()).map { row =>
           // we leave the left side as the last element of its child output
@@ -123,7 +124,7 @@ case class GenerateExec(
     }
   }
 
-  override def supportCodegen: Boolean = false
+  override def supportCodegen: Boolean = generator.supportCodegen
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     child.asInstanceOf[CodegenSupport].inputRDDs()
@@ -136,16 +137,13 @@ case class GenerateExec(
   override def needCopyResult: Boolean = true
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
-    // Add input rows to the values when we are joining
-    val values = if (requiredChildOutput.nonEmpty) {
-      input
-    } else {
-      Seq.empty
-    }
-
+    val requiredAttrSet = AttributeSet(requiredChildOutput)
+    val requiredInput = child.output.zip(input).filter {
+      case (attr, _) => requiredAttrSet.contains(attr)
+    }.map(_._2)
     boundGenerator match {
-      case e: CollectionGenerator => codeGenCollection(ctx, e, values, row)
-      case g => codeGenTraversableOnce(ctx, g, values, row)
+      case e: CollectionGenerator => codeGenCollection(ctx, e, requiredInput, row)
+      case g => codeGenTraversableOnce(ctx, g, requiredInput, row)
     }
   }
 
@@ -170,10 +168,11 @@ case class GenerateExec(
     // Add position
     val position = if (e.position) {
       if (outer) {
-        Seq(ExprCode("", StatementValue(s"$index == -1", CodeGenerator.JAVA_BOOLEAN),
-          VariableValue(index, CodeGenerator.JAVA_INT)))
+        Seq(ExprCode(
+          JavaCode.isNullExpression(s"$index == -1"),
+          JavaCode.variable(index, IntegerType)))
       } else {
-        Seq(ExprCode("", FalseLiteral, VariableValue(index, CodeGenerator.JAVA_INT)))
+        Seq(ExprCode(FalseLiteral, JavaCode.variable(index, IntegerType)))
       }
     } else {
       Seq.empty
@@ -242,7 +241,7 @@ case class GenerateExec(
   private def codeGenTraversableOnce(
       ctx: CodegenContext,
       e: Expression,
-      input: Seq[ExprCode],
+      requiredInput: Seq[ExprCode],
       row: ExprCode): String = {
 
     // Generate the code for the generator
@@ -278,7 +277,7 @@ case class GenerateExec(
          |  boolean $hasNext = $iterator.hasNext();
          |  InternalRow $current = (InternalRow)($hasNext? $iterator.next() : null);
          |  $outerVal = false;
-         |  ${consume(ctx, input ++ values)}
+         |  ${consume(ctx, requiredInput ++ values)}
          |}
       """.stripMargin
     } else {
@@ -288,7 +287,7 @@ case class GenerateExec(
          |while ($iterator.hasNext()) {
          |  $numOutput.add(1);
          |  InternalRow $current = (InternalRow)($iterator.next());
-         |  ${consume(ctx, input ++ values)}
+         |  ${consume(ctx, requiredInput ++ values)}
          |}
       """.stripMargin
     }
@@ -312,15 +311,13 @@ case class GenerateExec(
     if (checks.nonEmpty) {
       val isNull = ctx.freshName("isNull")
       val code =
-        s"""
+        code"""
            |boolean $isNull = ${checks.mkString(" || ")};
            |$javaType $value = $isNull ? ${CodeGenerator.defaultValue(dt)} : $getter;
          """.stripMargin
-      ExprCode(code, VariableValue(isNull, CodeGenerator.JAVA_BOOLEAN),
-        VariableValue(value, javaType))
+      ExprCode(code, JavaCode.isNullVariable(isNull), JavaCode.variable(value, dt))
     } else {
-      ExprCode(s"$javaType $value = $getter;", FalseLiteral,
-        VariableValue(value, javaType))
+      ExprCode(code"$javaType $value = $getter;", FalseLiteral, JavaCode.variable(value, dt))
     }
   }
 

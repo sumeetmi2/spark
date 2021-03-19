@@ -154,15 +154,20 @@ sparkR.sparkContext <- function(
   connectionTimeout <- as.numeric(Sys.getenv("SPARKR_BACKEND_CONNECTION_TIMEOUT", "6000"))
   if (existingPort != "") {
     if (length(packages) != 0) {
-      warning(paste("sparkPackages has no effect when using spark-submit or sparkR shell",
-                    " please use the --packages commandline instead", sep = ","))
+      warning("sparkPackages has no effect when using spark-submit or sparkR shell, ",
+              "please use the --packages commandline instead")
     }
     backendPort <- existingPort
+    authSecret <- Sys.getenv("SPARKR_BACKEND_AUTH_SECRET")
+    if (nchar(authSecret) == 0) {
+      stop("Auth secret not provided in environment.")
+    }
   } else {
     path <- tempfile(pattern = "backend_port")
     submitOps <- getClientModeSparkSubmitOpts(
         Sys.getenv("SPARKR_SUBMIT_ARGS", "sparkr-shell"),
         sparkEnvirMap)
+    invisible(checkJavaVersion())
     launchBackend(
         args = path,
         sparkHome = sparkHome,
@@ -186,16 +191,27 @@ sparkR.sparkContext <- function(
     monitorPort <- readInt(f)
     rLibPath <- readString(f)
     connectionTimeout <- readInt(f)
+
+    # Don't use readString() so that we can provide a useful
+    # error message if the R and Java versions are mismatched.
+    authSecretLen <- readInt(f)
+    if (length(authSecretLen) == 0 || authSecretLen == 0) {
+      stop("Unexpected EOF in JVM connection data. Mismatched versions?")
+    }
+    authSecret <- readStringData(f, authSecretLen)
     close(f)
     file.remove(path)
     if (length(backendPort) == 0 || backendPort == 0 ||
         length(monitorPort) == 0 || monitorPort == 0 ||
-        length(rLibPath) != 1) {
+        length(rLibPath) != 1 || length(authSecret) == 0) {
       stop("JVM failed to launch")
     }
-    assign(".monitorConn",
-           socketConnection(port = monitorPort, timeout = connectionTimeout),
-           envir = .sparkREnv)
+
+    monitorConn <- socketConnection(port = monitorPort, blocking = TRUE,
+                                    timeout = connectionTimeout, open = "wb")
+    doServerAuth(monitorConn, authSecret)
+
+    assign(".monitorConn", monitorConn, envir = .sparkREnv)
     assign(".backendLaunched", 1, envir = .sparkREnv)
     if (rLibPath != "") {
       assign(".libPath", rLibPath, envir = .sparkREnv)
@@ -205,7 +221,7 @@ sparkR.sparkContext <- function(
 
   .sparkREnv$backendPort <- backendPort
   tryCatch({
-    connectBackend("localhost", backendPort, timeout = connectionTimeout)
+    connectBackend("localhost", backendPort, timeout = connectionTimeout, authSecret = authSecret)
   },
   error = function(err) {
     stop("Failed to connect JVM\n")
@@ -228,7 +244,7 @@ sparkR.sparkContext <- function(
     uriSep <- "////"
   }
   localJarPaths <- lapply(jars,
-                          function(j) { utils::URLencode(paste("file:", uriSep, j, sep = "")) })
+                          function(j) { utils::URLencode(paste0("file:", uriSep, j)) })
 
   # Set the start time to identify jobjs
   # Seconds resolution is good enough for this purpose, so use ints
@@ -348,11 +364,12 @@ sparkRHive.init <- function(jsc = NULL) {
 #' df <- read.json(path)
 #'
 #' sparkR.session("local[2]", "SparkR", "/home/spark")
-#' sparkR.session("yarn-client", "SparkR", "/home/spark",
-#'                list(spark.executor.memory="4g"),
+#' sparkR.session("yarn", "SparkR", "/home/spark",
+#'                list(spark.executor.memory="4g", spark.submit.deployMode="client"),
 #'                c("one.jar", "two.jar", "three.jar"),
-#'                c("com.databricks:spark-avro_2.11:2.0.1"))
-#' sparkR.session(spark.master = "yarn-client", spark.executor.memory = "4g")
+#'                c("com.databricks:spark-avro_2.12:2.0.1"))
+#' sparkR.session(spark.master = "yarn", spark.submit.deployMode = "client",
+#                 spark.executor.memory = "4g")
 #'}
 #' @note sparkR.session since 2.0.0
 sparkR.session <- function(
@@ -418,12 +435,13 @@ sparkR.session <- function(
   # Check if version number of SparkSession matches version number of SparkR package
   jvmVersion <- callJMethod(sparkSession, "version")
   # Remove -SNAPSHOT from jvm versions
-  jvmVersionStrip <- gsub("-SNAPSHOT", "", jvmVersion)
+  jvmVersionStrip <- gsub("-SNAPSHOT", "", jvmVersion, fixed = TRUE)
   rPackageVersion <- paste0(packageVersion("SparkR"))
 
   if (jvmVersionStrip != rPackageVersion) {
-    warning(paste("Version mismatch between Spark JVM and SparkR package. JVM version was",
-                  jvmVersion, ", while R package version was", rPackageVersion))
+    warning("Version mismatch between Spark JVM and SparkR package. ",
+            "JVM version was ", jvmVersion,
+            ", while R package version was ", rPackageVersion)
   }
 
   sparkSession
@@ -466,24 +484,9 @@ sparkR.uiWebUrl <- function() {
 #' setJobGroup("myJobGroup", "My job group description", TRUE)
 #'}
 #' @note setJobGroup since 1.5.0
-#' @method setJobGroup default
-setJobGroup.default <- function(groupId, description, interruptOnCancel) {
+setJobGroup <- function(groupId, description, interruptOnCancel) {
   sc <- getSparkContext()
   invisible(callJMethod(sc, "setJobGroup", groupId, description, interruptOnCancel))
-}
-
-setJobGroup <- function(sc, groupId, description, interruptOnCancel) {
-  if (class(sc) == "jobj" && any(grepl("JavaSparkContext", getClassName.jobj(sc)))) {
-    .Deprecated("setJobGroup(groupId, description, interruptOnCancel)",
-                old = "setJobGroup(sc, groupId, description, interruptOnCancel)")
-    setJobGroup.default(groupId, description, interruptOnCancel)
-  } else {
-    # Parameter order is shifted
-    groupIdToUse <- sc
-    descriptionToUse <- groupId
-    interruptOnCancelToUse <- description
-    setJobGroup.default(groupIdToUse, descriptionToUse, interruptOnCancelToUse)
-  }
 }
 
 #' Clear current job group ID and its description
@@ -496,21 +499,10 @@ setJobGroup <- function(sc, groupId, description, interruptOnCancel) {
 #' clearJobGroup()
 #'}
 #' @note clearJobGroup since 1.5.0
-#' @method clearJobGroup default
-clearJobGroup.default <- function() {
+clearJobGroup <- function() {
   sc <- getSparkContext()
   invisible(callJMethod(sc, "clearJobGroup"))
 }
-
-clearJobGroup <- function(sc) {
-  if (!missing(sc) &&
-      class(sc) == "jobj" &&
-      any(grepl("JavaSparkContext", getClassName.jobj(sc)))) {
-    .Deprecated("clearJobGroup()", old = "clearJobGroup(sc)")
-  }
-  clearJobGroup.default()
-}
-
 
 #' Cancel active jobs for the specified group
 #'
@@ -523,21 +515,9 @@ clearJobGroup <- function(sc) {
 #' cancelJobGroup("myJobGroup")
 #'}
 #' @note cancelJobGroup since 1.5.0
-#' @method cancelJobGroup default
-cancelJobGroup.default <- function(groupId) {
+cancelJobGroup <- function(groupId) {
   sc <- getSparkContext()
   invisible(callJMethod(sc, "cancelJobGroup", groupId))
-}
-
-cancelJobGroup <- function(sc, groupId) {
-  if (class(sc) == "jobj" && any(grepl("JavaSparkContext", getClassName.jobj(sc)))) {
-    .Deprecated("cancelJobGroup(groupId)", old = "cancelJobGroup(sc, groupId)")
-    cancelJobGroup.default(groupId)
-  } else {
-    # Parameter order is shifted
-    groupIdToUse <- sc
-    cancelJobGroup.default(groupIdToUse)
-  }
 }
 
 #' Set a human readable description of the current job.
@@ -610,6 +590,8 @@ sparkConfToSubmitOps[["spark.driver.extraLibraryPath"]] <- "--driver-library-pat
 sparkConfToSubmitOps[["spark.master"]] <- "--master"
 sparkConfToSubmitOps[["spark.yarn.keytab"]] <- "--keytab"
 sparkConfToSubmitOps[["spark.yarn.principal"]] <- "--principal"
+sparkConfToSubmitOps[["spark.kerberos.keytab"]] <- "--keytab"
+sparkConfToSubmitOps[["spark.kerberos.principal"]] <- "--principal"
 
 
 # Utility function that returns Spark Submit arguments as a string
@@ -625,7 +607,7 @@ getClientModeSparkSubmitOpts <- function(submitOps, sparkEnvirMap) {
     # process only if --option is not already specified
     if (!is.null(opsValue) &&
         nchar(opsValue) > 1 &&
-        !grepl(sparkConfToSubmitOps[[conf]], submitOps)) {
+        !grepl(sparkConfToSubmitOps[[conf]], submitOps, fixed = TRUE)) {
       # put "" around value in case it has spaces
       paste0(sparkConfToSubmitOps[[conf]], " \"", opsValue, "\" ")
     } else {
@@ -685,5 +667,19 @@ sparkCheckInstall <- function(sparkHome, master, deployMode) {
     }
   } else {
     NULL
+  }
+}
+
+# Utility function for sending auth data over a socket and checking the server's reply.
+doServerAuth <- function(con, authSecret) {
+  if (nchar(authSecret) == 0) {
+    stop("Auth secret not provided.")
+  }
+  writeString(con, authSecret)
+  flush(con)
+  reply <- readString(con)
+  if (reply != "ok") {
+    close(con)
+    stop("Unexpected reply from server.")
   }
 }

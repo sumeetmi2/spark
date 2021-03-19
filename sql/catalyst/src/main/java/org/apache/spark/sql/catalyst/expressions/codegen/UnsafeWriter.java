@@ -16,9 +16,13 @@
  */
 package org.apache.spark.sql.catalyst.expressions.codegen;
 
+import org.apache.spark.sql.catalyst.expressions.UnsafeArrayData;
+import org.apache.spark.sql.catalyst.expressions.UnsafeMapData;
+import org.apache.spark.sql.catalyst.expressions.UnsafeRow;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.unsafe.Platform;
 import org.apache.spark.unsafe.array.ByteArrayMethods;
+import org.apache.spark.unsafe.bitset.BitSetMethods;
 import org.apache.spark.unsafe.types.CalendarInterval;
 import org.apache.spark.unsafe.types.UTF8String;
 
@@ -103,21 +107,7 @@ public abstract class UnsafeWriter {
   public abstract void write(int ordinal, Decimal input, int precision, int scale);
 
   public final void write(int ordinal, UTF8String input) {
-    final int numBytes = input.numBytes();
-    final int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(numBytes);
-
-    // grow the global buffer before writing data.
-    grow(roundedSize);
-
-    zeroOutPaddingBytes(numBytes);
-
-    // Write the bytes to the variable length portion.
-    input.writeToMemory(getBuffer(), cursor());
-
-    setOffsetAndSize(ordinal, numBytes);
-
-    // move the cursor forward.
-    increaseCursor(roundedSize);
+    writeUnalignedBytes(ordinal, input.getBaseObject(), input.getBaseOffset(), input.numBytes());
   }
 
   public final void write(int ordinal, byte[] input) {
@@ -125,20 +115,19 @@ public abstract class UnsafeWriter {
   }
 
   public final void write(int ordinal, byte[] input, int offset, int numBytes) {
-    final int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(input.length);
+    writeUnalignedBytes(ordinal, input, Platform.BYTE_ARRAY_OFFSET + offset, numBytes);
+  }
 
-    // grow the global buffer before writing data.
+  private void writeUnalignedBytes(
+      int ordinal,
+      Object baseObject,
+      long baseOffset,
+      int numBytes) {
+    final int roundedSize = ByteArrayMethods.roundNumberOfBytesToNearestWord(numBytes);
     grow(roundedSize);
-
     zeroOutPaddingBytes(numBytes);
-
-    // Write the bytes to the variable length portion.
-    Platform.copyMemory(
-      input, Platform.BYTE_ARRAY_OFFSET + offset, getBuffer(), cursor(), numBytes);
-
+    Platform.copyMemory(baseObject, baseOffset, getBuffer(), cursor(), numBytes);
     setOffsetAndSize(ordinal, numBytes);
-
-    // move the cursor forward.
     increaseCursor(roundedSize);
   }
 
@@ -146,14 +135,52 @@ public abstract class UnsafeWriter {
     // grow the global buffer before writing data.
     grow(16);
 
-    // Write the months and microseconds fields of Interval to the variable length portion.
-    Platform.putLong(getBuffer(), cursor(), input.months);
-    Platform.putLong(getBuffer(), cursor() + 8, input.microseconds);
-
+    if (input == null) {
+      BitSetMethods.set(getBuffer(), startingOffset, ordinal);
+    } else {
+      // Write the months, days and microseconds fields of interval to the variable length portion.
+      Platform.putInt(getBuffer(), cursor(), input.months);
+      Platform.putInt(getBuffer(), cursor() + 4, input.days);
+      Platform.putLong(getBuffer(), cursor() + 8, input.microseconds);
+    }
+    // we need to reserve the space so that we can update it later.
     setOffsetAndSize(ordinal, 16);
-
     // move the cursor forward.
     increaseCursor(16);
+  }
+
+  public final void write(int ordinal, UnsafeRow row) {
+    writeAlignedBytes(ordinal, row.getBaseObject(), row.getBaseOffset(), row.getSizeInBytes());
+  }
+
+  public final void write(int ordinal, UnsafeMapData map) {
+    writeAlignedBytes(ordinal, map.getBaseObject(), map.getBaseOffset(), map.getSizeInBytes());
+  }
+
+  public final void write(UnsafeArrayData array) {
+    // Unsafe arrays both can be written as a regular array field or as part of a map. This makes
+    // updating the offset and size dependent on the code path, this is why we currently do not
+    // provide an method for writing unsafe arrays that also updates the size and offset.
+    int numBytes = array.getSizeInBytes();
+    grow(numBytes);
+    Platform.copyMemory(
+            array.getBaseObject(),
+            array.getBaseOffset(),
+            getBuffer(),
+            cursor(),
+            numBytes);
+    increaseCursor(numBytes);
+  }
+
+  private void writeAlignedBytes(
+      int ordinal,
+      Object baseObject,
+      long baseOffset,
+      int numBytes) {
+    grow(numBytes);
+    Platform.copyMemory(baseObject, baseOffset, getBuffer(), cursor(), numBytes);
+    setOffsetAndSize(ordinal, numBytes);
+    increaseCursor(numBytes);
   }
 
   protected final void writeBoolean(long offset, boolean value) {
@@ -177,16 +204,10 @@ public abstract class UnsafeWriter {
   }
 
   protected final void writeFloat(long offset, float value) {
-    if (Float.isNaN(value)) {
-      value = Float.NaN;
-    }
     Platform.putFloat(getBuffer(), offset, value);
   }
 
   protected final void writeDouble(long offset, double value) {
-    if (Double.isNaN(value)) {
-      value = Double.NaN;
-    }
     Platform.putDouble(getBuffer(), offset, value);
   }
 }

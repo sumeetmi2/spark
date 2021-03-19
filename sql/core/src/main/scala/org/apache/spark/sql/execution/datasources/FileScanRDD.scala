@@ -19,15 +19,14 @@ package org.apache.spark.sql.execution.datasources
 
 import java.io.{FileNotFoundException, IOException}
 
-import scala.collection.mutable
-
 import org.apache.parquet.io.ParquetDecodingException
 
-import org.apache.spark.{Partition => RDDPartition, TaskContext, TaskKilledException}
+import org.apache.spark.{Partition => RDDPartition, SparkUpgradeException, TaskContext}
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.{InputFileBlockHolder, RDD}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.NextIterator
@@ -37,7 +36,7 @@ import org.apache.spark.util.NextIterator
  * that need to be prepended to each row.
  *
  * @param partitionValues value of partition columns to be prepended to each row.
- * @param filePath path of the file to read
+ * @param filePath URI of the file to read
  * @param start the beginning offset (in bytes) of the block.
  * @param length number of bytes to read.
  * @param locations locality information (list of nodes that have the data).
@@ -52,12 +51,6 @@ case class PartitionedFile(
     s"path: $filePath, range: $start-${start + length}, partition values: $partitionValues"
   }
 }
-
-/**
- * A collection of file blocks that should be read as a single task
- * (possibly from multiple partitioned directories).
- */
-case class FilePartition(index: Int, files: Seq[PartitionedFile]) extends RDDPartition
 
 /**
  * An RDD that scans a list of file partitions.
@@ -85,16 +78,8 @@ class FileScanRDD(
       // If we do a coalesce, however, we are likely to compute multiple partitions in the same
       // task and in the same thread, in which case we need to avoid override values written by
       // previous partitions (SPARK-13071).
-      private def updateBytesRead(): Unit = {
+      private def incTaskInputMetricsBytesRead(): Unit = {
         inputMetrics.setBytesRead(existingBytesRead + getBytesReadCallback())
-      }
-
-      // If we can't get the bytes read from the FS stats, fall back to the file size,
-      // which may be inaccurate.
-      private def updateBytesReadWithFileSize(): Unit = {
-        if (currentFile != null) {
-          inputMetrics.incBytesRead(currentFile.length)
-        }
       }
 
       private[this] val files = split.asInstanceOf[FilePartition].files.toIterator
@@ -112,13 +97,17 @@ class FileScanRDD(
         val nextElement = currentIterator.next()
         // TODO: we should have a better separation of row based and batch based scan, so that we
         // don't need to run this `if` for every record.
+        val preNumRecordsRead = inputMetrics.recordsRead
         if (nextElement.isInstanceOf[ColumnarBatch]) {
+          incTaskInputMetricsBytesRead()
           inputMetrics.incRecordsRead(nextElement.asInstanceOf[ColumnarBatch].numRows())
         } else {
+          // too costly to update every record
+          if (inputMetrics.recordsRead %
+              SparkHadoopUtil.UPDATE_INPUT_METRICS_INTERVAL_RECORDS == 0) {
+            incTaskInputMetricsBytesRead()
+          }
           inputMetrics.incRecordsRead(1)
-        }
-        if (inputMetrics.recordsRead % SparkHadoopUtil.UPDATE_INPUT_METRICS_INTERVAL_RECORDS == 0) {
-          updateBytesRead()
         }
         nextElement
       }
@@ -128,18 +117,12 @@ class FileScanRDD(
           readFunction(currentFile)
         } catch {
           case e: FileNotFoundException =>
-            throw new FileNotFoundException(
-              e.getMessage + "\n" +
-                "It is possible the underlying files have been updated. " +
-                "You can explicitly invalidate the cache in Spark by " +
-                "running 'REFRESH TABLE tableName' command in SQL or " +
-                "by recreating the Dataset/DataFrame involved.")
+            throw QueryExecutionErrors.readCurrentFileNotFoundError(e)
         }
       }
 
       /** Advances to the next file. Returns true if a new non-empty iterator is available. */
       private def nextIterator(): Boolean = {
-        updateBytesReadWithFileSize()
         if (files.hasNext) {
           currentFile = files.next()
           logInfo(s"Reading File $currentFile")
@@ -191,7 +174,9 @@ class FileScanRDD(
                 s"Expected: ${e.getLogicalType}, Found: ${e.getPhysicalType}"
               throw new QueryExecutionException(message, e)
             case e: ParquetDecodingException =>
-              if (e.getMessage.contains("Can not read value at")) {
+              if (e.getCause.isInstanceOf[SparkUpgradeException]) {
+                throw e.getCause
+              } else if (e.getMessage.contains("Can not read value at")) {
                 val message = "Encounter error while reading parquet files. " +
                   "One possible cause: Parquet column cannot be converted in the " +
                   "corresponding files. Details: "
@@ -207,14 +192,13 @@ class FileScanRDD(
       }
 
       override def close(): Unit = {
-        updateBytesRead()
-        updateBytesReadWithFileSize()
+        incTaskInputMetricsBytesRead()
         InputFileBlockHolder.unset()
       }
     }
 
     // Register an on-task-completion callback to close the input stream.
-    context.addTaskCompletionListener(_ => iterator.close())
+    context.addTaskCompletionListener[Unit](_ => iterator.close())
 
     iterator.asInstanceOf[Iterator[InternalRow]] // This is an erasure hack.
   }
@@ -222,21 +206,6 @@ class FileScanRDD(
   override protected def getPartitions: Array[RDDPartition] = filePartitions.toArray
 
   override protected def getPreferredLocations(split: RDDPartition): Seq[String] = {
-    val files = split.asInstanceOf[FilePartition].files
-
-    // Computes total number of bytes can be retrieved from each host.
-    val hostToNumBytes = mutable.HashMap.empty[String, Long]
-    files.foreach { file =>
-      file.locations.filter(_ != "localhost").foreach { host =>
-        hostToNumBytes(host) = hostToNumBytes.getOrElse(host, 0L) + file.length
-      }
-    }
-
-    // Takes the first 3 hosts with the most data to be retrieved
-    hostToNumBytes.toSeq.sortBy {
-      case (host, numBytes) => numBytes
-    }.reverse.take(3).map {
-      case (host, numBytes) => host
-    }
+    split.asInstanceOf[FilePartition].preferredLocations()
   }
 }

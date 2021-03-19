@@ -20,20 +20,20 @@ package org.apache.spark.sql.catalyst.expressions.objects
 import java.lang.reflect.{Method, Modifier}
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.Builder
-import scala.language.existentials
+import scala.collection.mutable.{Builder, IndexedSeq, WrappedArray}
 import scala.reflect.ClassTag
-import scala.util.Try
+import scala.util.{Properties, Try}
 
 import org.apache.spark.{SparkConf, SparkEnv}
 import org.apache.spark.serializer._
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.catalyst.{InternalRow, ScalaReflection}
-import org.apache.spark.sql.catalyst.ScalaReflection.universe.TermName
+import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, ScalaReflection}
 import org.apache.spark.sql.catalyst.encoders.RowEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen._
-import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
+import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData, MapData}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
@@ -65,7 +65,7 @@ trait InvokeLike extends Expression with NonSQLExpression {
 
     val resultIsNull = if (needNullCheck) {
       val resultIsNull = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "resultIsNull")
-      GlobalValue(resultIsNull, CodeGenerator.JAVA_BOOLEAN)
+      JavaCode.isNullGlobal(resultIsNull)
     } else {
       FalseLiteral
     }
@@ -268,7 +268,7 @@ case class StaticInvoke(
       s"${ev.value} = $callFunc;"
     }
 
-    val code = s"""
+    val code = code"""
       $argCode
       $prepareIsNull
       $javaType ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
@@ -311,7 +311,7 @@ case class Invoke(
   override def nullable: Boolean = targetObject.nullable || needNullCheck || returnNullable
   override def children: Seq[Expression] = targetObject +: arguments
 
-  private lazy val encodedFunctionName = TermName(functionName).encodedName.toString
+  private lazy val encodedFunctionName = ScalaReflection.encodeFieldNameToIdentifier(functionName)
 
   @transient lazy val method = targetObject.dataType match {
     case ObjectType(cls) =>
@@ -333,7 +333,7 @@ case class Invoke(
       val invokeMethod = if (method.isDefined) {
         method.get
       } else {
-        obj.getClass.getDeclaredMethod(functionName, argClasses: _*)
+        obj.getClass.getMethod(functionName, argClasses: _*)
       }
       invoke(obj, invokeMethod, arguments, input, dataType)
     }
@@ -384,8 +384,7 @@ case class Invoke(
       """
     }
 
-    val code = s"""
-      ${obj.code}
+    val code = obj.code + code"""
       boolean ${ev.isNull} = true;
       $javaType ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
       if (!${obj.isNull}) {
@@ -445,12 +444,35 @@ case class NewInstance(
     // Note that static inner classes (e.g., inner classes within Scala objects) don't need
     // outer pointer registration.
     val needOuterPointer =
-      outerPointer.isEmpty && cls.isMemberClass && !Modifier.isStatic(cls.getModifiers)
+      outerPointer.isEmpty && Utils.isMemberClass(cls) && !Modifier.isStatic(cls.getModifiers)
     childrenResolved && !needOuterPointer
   }
 
-  override def eval(input: InternalRow): Any =
-    throw new UnsupportedOperationException("Only code-generated evaluation is supported.")
+  @transient private lazy val constructor: (Seq[AnyRef]) => Any = {
+    val paramTypes = ScalaReflection.expressionJavaClasses(arguments)
+    val getConstructor = (paramClazz: Seq[Class[_]]) => {
+      ScalaReflection.findConstructor(cls, paramClazz).getOrElse {
+        sys.error(s"Couldn't find a valid constructor on $cls")
+      }
+    }
+    outerPointer.map { p =>
+      val outerObj = p()
+      val c = getConstructor(outerObj.getClass +: paramTypes)
+      (args: Seq[AnyRef]) => {
+        c(outerObj +: args)
+      }
+    }.getOrElse {
+      val c = getConstructor(paramTypes)
+      (args: Seq[AnyRef]) => {
+        c(args)
+      }
+    }
+  }
+
+  override def eval(input: InternalRow): Any = {
+    val argValues = arguments.map(_.eval(input))
+    constructor(argValues.map(_.asInstanceOf[AnyRef]))
+  }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     val javaType = CodeGenerator.javaType(dataType)
@@ -461,13 +483,19 @@ case class NewInstance(
 
     ev.isNull = resultIsNull
 
-    val constructorCall = outer.map { gen =>
-      s"${gen.value}.new ${cls.getSimpleName}($argString)"
-    }.getOrElse {
-      s"new $className($argString)"
+    val constructorCall = cls.getConstructors.size match {
+      // If there are no constructors, the `new` method will fail. In
+      // this case we can try to call the apply method constructor
+      // that might be defined on the companion object.
+      case 0 => s"$className$$.MODULE$$.apply($argString)"
+      case _ => outer.map { gen =>
+        s"${gen.value}.new ${Utils.getSimpleName(cls)}($argString)"
+      }.getOrElse {
+        s"new $className($argString)"
+      }
     }
 
-    val code = s"""
+    val code = code"""
       $argCode
       ${outer.map(_.code).getOrElse("")}
       final $javaType ${ev.value} = ${ev.isNull} ?
@@ -507,9 +535,7 @@ case class UnwrapOption(
     val javaType = CodeGenerator.javaType(dataType)
     val inputObject = child.genCode(ctx)
 
-    val code = s"""
-      ${inputObject.code}
-
+    val code = inputObject.code + code"""
       final boolean ${ev.isNull} = ${inputObject.isNull} || ${inputObject.value}.isEmpty();
       $javaType ${ev.value} = ${ev.isNull} ? ${CodeGenerator.defaultValue(dataType)} :
         (${CodeGenerator.boxedType(javaType)}) ${inputObject.value}.get();
@@ -539,9 +565,7 @@ case class WrapOption(child: Expression, optType: DataType)
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     val inputObject = child.genCode(ctx)
 
-    val code = s"""
-      ${inputObject.code}
-
+    val code = inputObject.code + code"""
       scala.Option ${ev.value} =
         ${inputObject.isNull} ?
         scala.Option$$.MODULE$$.apply(null) : new scala.Some(${inputObject.value});
@@ -550,31 +574,64 @@ case class WrapOption(child: Expression, optType: DataType)
   }
 }
 
+object LambdaVariable {
+  private val curId = new java.util.concurrent.atomic.AtomicLong()
+
+  // Returns the codegen-ed `LambdaVariable` and add it to mutable states, so that it can be
+  // accessed anywhere in the generated code.
+  def prepareLambdaVariable(ctx: CodegenContext, variable: LambdaVariable): ExprCode = {
+    val variableCode = variable.genCode(ctx)
+    assert(variableCode.code.isEmpty)
+
+    ctx.addMutableState(
+      CodeGenerator.javaType(variable.dataType),
+      variableCode.value,
+      forceInline = true,
+      useFreshName = false)
+
+    if (variable.nullable) {
+      ctx.addMutableState(
+        CodeGenerator.JAVA_BOOLEAN,
+        variableCode.isNull,
+        forceInline = true,
+        useFreshName = false)
+    }
+
+    variableCode
+  }
+}
+
 /**
- * A placeholder for the loop variable used in [[MapObjects]].  This should never be constructed
+ * A placeholder for the loop variable used in [[MapObjects]]. This should never be constructed
  * manually, but will instead be passed into the provided lambda function.
  */
+// TODO: Merge this and `NamedLambdaVariable`.
 case class LambdaVariable(
-    value: String,
-    isNull: String,
+    name: String,
     dataType: DataType,
-    nullable: Boolean = true) extends LeafExpression with NonSQLExpression {
+    nullable: Boolean,
+    id: Long = LambdaVariable.curId.incrementAndGet) extends LeafExpression with NonSQLExpression {
+
+  private val accessor: (InternalRow, Int) => Any = InternalRow.getAccessor(dataType, nullable)
 
   // Interpreted execution of `LambdaVariable` always get the 0-index element from input row.
   override def eval(input: InternalRow): Any = {
     assert(input.numFields == 1,
       "The input row of interpreted LambdaVariable should have only 1 field.")
-    input.get(0, dataType)
+    accessor(input, 0)
   }
 
   override def genCode(ctx: CodegenContext): ExprCode = {
-    val isNullValue = if (nullable) {
-      VariableValue(isNull, CodeGenerator.JAVA_BOOLEAN)
+    // If `LambdaVariable` IDs are reassigned by the `ReassignLambdaVariableID` rule, the IDs will
+    // all be negative.
+    val suffix = "lambda_variable_" + math.abs(id)
+    val isNull = if (nullable) {
+      JavaCode.isNullVariable(s"isNull_${name}_$suffix")
     } else {
       FalseLiteral
     }
-    ExprCode(code = "", value = VariableValue(value, CodeGenerator.javaType(dataType)),
-      isNull = isNullValue)
+    val value = JavaCode.variable(s"value_${name}_$suffix", dataType)
+    ExprCode(isNull, value)
   }
 
   // This won't be called as `genCode` is overrided, just overriding it to make
@@ -599,13 +656,11 @@ case class UnresolvedMapObjects(
   override lazy val resolved = false
 
   override def dataType: DataType = customCollectionCls.map(ObjectType.apply).getOrElse {
-    throw new UnsupportedOperationException("not resolved")
+    throw QueryExecutionErrors.customCollectionClsNotResolvedError
   }
 }
 
 object MapObjects {
-  private val curId = new java.util.concurrent.atomic.AtomicInteger()
-
   /**
    * Construct an instance of MapObjects case class.
    *
@@ -623,16 +678,15 @@ object MapObjects {
       elementType: DataType,
       elementNullable: Boolean = true,
       customCollectionCls: Option[Class[_]] = None): MapObjects = {
-    val id = curId.getAndIncrement()
-    val loopValue = s"MapObjects_loopValue$id"
-    val loopIsNull = if (elementNullable) {
-      s"MapObjects_loopIsNull$id"
-    } else {
-      "false"
-    }
-    val loopVar = LambdaVariable(loopValue, loopIsNull, elementType, elementNullable)
-    MapObjects(
-      loopValue, loopIsNull, elementType, function(loopVar), inputData, customCollectionCls)
+    // UnresolvedMapObjects does not serialize its 'function' field.
+    // If an array expression or array Encoder is not correctly resolved before
+    // serialization, this exception condition may occur.
+    require(function != null,
+      "MapObjects applied with a null function. " +
+      "Likely cause is failure to resolve an array expression or encoder. " +
+      "(See UnresolvedMapObjects)")
+    val loopVar = LambdaVariable("MapObject", elementType, elementNullable)
+    MapObjects(loopVar, function(loopVar), inputData, customCollectionCls)
   }
 }
 
@@ -648,12 +702,8 @@ object MapObjects {
  * The following collection ObjectTypes are currently supported on input:
  *   Seq, Array, ArrayData, java.util.List
  *
- * @param loopValue the name of the loop variable that used when iterate the collection, and used
- *                  as input for the `lambdaFunction`
- * @param loopIsNull the nullity of the loop variable that used when iterate the collection, and
- *                   used as input for the `lambdaFunction`
- * @param loopVarDataType the data type of the loop variable that used when iterate the collection,
- *                        and used as input for the `lambdaFunction`
+ * @param loopVar the [[LambdaVariable]] expression representing the loop variable that used to
+ *                iterate the collection, and used as input for the `lambdaFunction`.
  * @param lambdaFunction A function that take the `loopVar` as input, and used as lambda function
  *                       to handle collection elements.
  * @param inputData An expression that when evaluated returns a collection object.
@@ -661,16 +711,14 @@ object MapObjects {
  *                            or None (returning ArrayType)
  */
 case class MapObjects private(
-    loopValue: String,
-    loopIsNull: String,
-    loopVarDataType: DataType,
+    loopVar: LambdaVariable,
     lambdaFunction: Expression,
     inputData: Expression,
     customCollectionCls: Option[Class[_]]) extends Expression with NonSQLExpression {
 
   override def nullable: Boolean = inputData.nullable
 
-  override def children: Seq[Expression] = lambdaFunction :: inputData :: Nil
+  override def children: Seq[Expression] = Seq(loopVar, lambdaFunction, inputData)
 
   // The data with UserDefinedType are actually stored with the data type of its sqlType.
   // When we want to apply MapObjects on it, we have to use it.
@@ -688,12 +736,12 @@ case class MapObjects private(
   }
 
   private lazy val convertToSeq: Any => Seq[_] = inputDataType match {
-    case ObjectType(cls) if classOf[Seq[_]].isAssignableFrom(cls) =>
-      _.asInstanceOf[Seq[_]]
+    case ObjectType(cls) if classOf[scala.collection.Seq[_]].isAssignableFrom(cls) =>
+      _.asInstanceOf[scala.collection.Seq[_]].toSeq
     case ObjectType(cls) if cls.isArray =>
       _.asInstanceOf[Array[_]].toSeq
     case ObjectType(cls) if classOf[java.util.List[_]].isAssignableFrom(cls) =>
-      _.asInstanceOf[java.util.List[_]].asScala
+      _.asInstanceOf[java.util.List[_]].asScala.toSeq
     case ObjectType(cls) if cls == classOf[Object] =>
       (inputCollection) => {
         if (inputCollection.getClass.isArray) {
@@ -703,11 +751,14 @@ case class MapObjects private(
         }
       }
     case ArrayType(et, _) =>
-      _.asInstanceOf[ArrayData].array
+      _.asInstanceOf[ArrayData].toSeq[Any](et)
   }
 
   private lazy val mapElements: Seq[_] => Any = customCollectionCls match {
-    case Some(cls) if classOf[Seq[_]].isAssignableFrom(cls) =>
+    case Some(cls) if classOf[WrappedArray[_]].isAssignableFrom(cls) =>
+      // Scala WrappedArray
+      inputCollection => WrappedArray.make(executeFuncOnCollection(inputCollection).toArray)
+    case Some(cls) if classOf[scala.collection.Seq[_]].isAssignableFrom(cls) =>
       // Scala sequence
       executeFuncOnCollection(_).toSeq
     case Some(cls) if classOf[scala.collection.Set[_]].isAssignableFrom(cls) =>
@@ -746,8 +797,7 @@ case class MapObjects private(
       // array
       x => new GenericArrayData(executeFuncOnCollection(x).toArray)
     case Some(cls) =>
-      throw new RuntimeException(s"class `${cls.getName}` is not supported by `MapObjects` as " +
-        "resulting collection.")
+      throw QueryExecutionErrors.classUnsupportedByMapObjectsError(cls)
   }
 
   override def eval(input: InternalRow): Any = {
@@ -764,8 +814,8 @@ case class MapObjects private(
       ArrayType(lambdaFunction.dataType, containsNull = lambdaFunction.nullable))
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val elementJavaType = CodeGenerator.javaType(loopVarDataType)
-    ctx.addMutableState(elementJavaType, loopValue, forceInline = true, useFreshName = false)
+    val elementJavaType = CodeGenerator.javaType(loopVar.dataType)
+    val loopVarCode = LambdaVariable.prepareLambdaVariable(ctx, loopVar)
     val genInputData = inputData.genCode(ctx)
     val genFunction = lambdaFunction.genCode(ctx)
     val dataLength = ctx.freshName("dataLength")
@@ -791,7 +841,7 @@ case class MapObjects private(
     val array = ctx.freshName("array")
     val determineCollectionType = inputData.dataType match {
       case ObjectType(cls) if cls == classOf[Object] =>
-        val seqClass = classOf[Seq[_]].getName
+        val seqClass = classOf[scala.collection.Seq[_]].getName
         s"""
           $seqClass $seq = null;
           $elementJavaType[] $array = null;
@@ -808,7 +858,7 @@ case class MapObjects private(
     // need to take care of Seq and List because they may have O(n) complexity for indexed accessing
     // like `list.get(1)`. Here we use Iterator to traverse Seq and List.
     val (getLength, prepareLoop, getLoopVar) = inputDataType match {
-      case ObjectType(cls) if classOf[Seq[_]].isAssignableFrom(cls) =>
+      case ObjectType(cls) if classOf[scala.collection.Seq[_]].isAssignableFrom(cls) =>
         val it = ctx.freshName("it")
         (
           s"${genInputData.value}.size()",
@@ -853,12 +903,10 @@ case class MapObjects private(
       case _ => genFunction.value
     }
 
-    val loopNullCheck = if (loopIsNull != "false") {
-      ctx.addMutableState(
-        CodeGenerator.JAVA_BOOLEAN, loopIsNull, forceInline = true, useFreshName = false)
+    val loopNullCheck = if (loopVar.nullable) {
       inputDataType match {
-        case _: ArrayType => s"$loopIsNull = ${genInputData.value}.isNullAt($loopIndex);"
-        case _ => s"$loopIsNull = $loopValue == null;"
+        case _: ArrayType => s"${loopVarCode.isNull} = ${genInputData.value}.isNullAt($loopIndex);"
+        case _ => s"${loopVarCode.isNull} = ${loopVarCode.value} == null;"
       }
     } else {
       ""
@@ -866,7 +914,46 @@ case class MapObjects private(
 
     val (initCollection, addElement, getResult): (String, String => String, String) =
       customCollectionCls match {
-        case Some(cls) if classOf[Seq[_]].isAssignableFrom(cls) ||
+        case Some(cls) if classOf[WrappedArray[_]].isAssignableFrom(cls) =>
+          def doCodeGenForScala212 = {
+            // WrappedArray in Scala 2.12
+            val getBuilder = s"${cls.getName}$$.MODULE$$.newBuilder()"
+            val builder = ctx.freshName("collectionBuilder")
+            (
+              s"""
+                 ${classOf[Builder[_, _]].getName} $builder = $getBuilder;
+                 $builder.sizeHint($dataLength);
+               """,
+              (genValue: String) => s"$builder.$$plus$$eq($genValue);",
+              s"(${cls.getName}) ${classOf[WrappedArray[_]].getName}$$." +
+                s"MODULE$$.make(((${classOf[IndexedSeq[_]].getName})$builder" +
+                s".result()).toArray(scala.reflect.ClassTag$$.MODULE$$.Object()));"
+            )
+          }
+
+          def doCodeGenForScala213 = {
+            // In Scala 2.13, WrappedArray is mutable.ArraySeq and newBuilder method need
+            // a ClassTag type construction parameter
+            val getBuilder = s"${cls.getName}$$.MODULE$$.newBuilder(" +
+              s"scala.reflect.ClassTag$$.MODULE$$.Object())"
+            val builder = ctx.freshName("collectionBuilder")
+            (
+              s"""
+                 ${classOf[Builder[_, _]].getName} $builder = $getBuilder;
+                 $builder.sizeHint($dataLength);
+               """,
+              (genValue: String) => s"$builder.$$plus$$eq($genValue);",
+              s"(${cls.getName})$builder.result();"
+            )
+          }
+
+          val scalaVersion = Properties.versionNumberString
+          if (scalaVersion.startsWith("2.12")) {
+            doCodeGenForScala212
+          } else {
+            doCodeGenForScala213
+          }
+        case Some(cls) if classOf[scala.collection.Seq[_]].isAssignableFrom(cls) ||
           classOf[scala.collection.Set[_]].isAssignableFrom(cls) =>
           // Scala sequence or set
           val getBuilder = s"${cls.getName}$$.MODULE$$.newBuilder()"
@@ -876,7 +963,7 @@ case class MapObjects private(
                ${classOf[Builder[_, _]].getName} $builder = $getBuilder;
                $builder.sizeHint($dataLength);
              """,
-            genValue => s"$builder.$$plus$$eq($genValue);",
+            (genValue: String) => s"$builder.$$plus$$eq($genValue);",
             s"(${cls.getName}) $builder.result();"
           )
         case Some(cls) if classOf[java.util.List[_]].isAssignableFrom(cls) =>
@@ -890,23 +977,22 @@ case class MapObjects private(
               val param = Try(cls.getConstructor(Integer.TYPE)).map(_ => dataLength).getOrElse("")
               s"${cls.getName} $builder = new ${cls.getName}($param);"
             },
-            genValue => s"$builder.add($genValue);",
+            (genValue: String) => s"$builder.add($genValue);",
             s"$builder;"
           )
-        case None =>
+        case _ =>
           // array
           (
             s"""
                $convertedType[] $convertedArray = null;
                $convertedArray = $arrayConstructor;
              """,
-            genValue => s"$convertedArray[$loopIndex] = $genValue;",
+            (genValue: String) => s"$convertedArray[$loopIndex] = $genValue;",
             s"new ${classOf[GenericArrayData].getName}($convertedArray);"
           )
       }
 
-    val code = s"""
-      ${genInputData.code}
+    val code = genInputData.code + code"""
       ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
 
       if (!${genInputData.isNull}) {
@@ -917,7 +1003,7 @@ case class MapObjects private(
         int $loopIndex = 0;
         $prepareLoop
         while ($loopIndex < $dataLength) {
-          $loopValue = ($elementJavaType) ($getLoopVar);
+          ${loopVarCode.value} = ($elementJavaType) ($getLoopVar);
           $loopNullCheck
 
           ${genFunction.code}
@@ -937,37 +1023,36 @@ case class MapObjects private(
   }
 }
 
-object CatalystToExternalMap {
-  private val curId = new java.util.concurrent.atomic.AtomicInteger()
+/**
+ * Similar to [[UnresolvedMapObjects]], this is a placeholder of [[CatalystToExternalMap]].
+ *
+ * @param child An expression that when evaluated returns a map object.
+ * @param keyFunction The function applied on the key collection elements.
+ * @param valueFunction The function applied on the value collection elements.
+ * @param collClass The type of the resulting collection.
+ */
+case class UnresolvedCatalystToExternalMap(
+    child: Expression,
+    @transient keyFunction: Expression => Expression,
+    @transient valueFunction: Expression => Expression,
+    collClass: Class[_]) extends UnaryExpression with Unevaluable {
 
-  /**
-   * Construct an instance of CatalystToExternalMap case class.
-   *
-   * @param keyFunction The function applied on the key collection elements.
-   * @param valueFunction The function applied on the value collection elements.
-   * @param inputData An expression that when evaluated returns a map object.
-   * @param collClass The type of the resulting collection.
-   */
-  def apply(
-      keyFunction: Expression => Expression,
-      valueFunction: Expression => Expression,
-      inputData: Expression,
-      collClass: Class[_]): CatalystToExternalMap = {
-    val id = curId.getAndIncrement()
-    val keyLoopValue = s"CatalystToExternalMap_keyLoopValue$id"
-    val mapType = inputData.dataType.asInstanceOf[MapType]
-    val keyLoopVar = LambdaVariable(keyLoopValue, "", mapType.keyType, nullable = false)
-    val valueLoopValue = s"CatalystToExternalMap_valueLoopValue$id"
-    val valueLoopIsNull = if (mapType.valueContainsNull) {
-      s"CatalystToExternalMap_valueLoopIsNull$id"
-    } else {
-      "false"
-    }
-    val valueLoopVar = LambdaVariable(valueLoopValue, valueLoopIsNull, mapType.valueType)
+  override lazy val resolved = false
+
+  override def dataType: DataType = ObjectType(collClass)
+}
+
+object CatalystToExternalMap {
+  def apply(u: UnresolvedCatalystToExternalMap): CatalystToExternalMap = {
+    val mapType = u.child.dataType.asInstanceOf[MapType]
+    val keyLoopVar = LambdaVariable(
+      "CatalystToExternalMap_key", mapType.keyType, nullable = false)
+    val valueLoopVar = LambdaVariable(
+      "CatalystToExternalMap_value", mapType.valueType, mapType.valueContainsNull)
     CatalystToExternalMap(
-      keyLoopValue, keyFunction(keyLoopVar),
-      valueLoopValue, valueLoopIsNull, valueFunction(valueLoopVar),
-      inputData, collClass)
+      keyLoopVar, u.keyFunction(keyLoopVar),
+      valueLoopVar, u.valueFunction(valueLoopVar),
+      u.child, u.collClass)
   }
 }
 
@@ -976,54 +1061,76 @@ object CatalystToExternalMap {
  * The collection is constructed using the associated builder, obtained by calling `newBuilder`
  * on the collection's companion object.
  *
- * @param keyLoopValue the name of the loop variable that is used when iterating over the key
- *                     collection, and which is used as input for the `keyLambdaFunction`
+ * @param keyLoopVar the [[LambdaVariable]] expression representing the loop variable that is used
+ *                   when iterating over the key collection, and which is used as input for the
+ *                   `keyLambdaFunction`.
  * @param keyLambdaFunction A function that takes the `keyLoopVar` as input, and is used as
  *                          a lambda function to handle collection elements.
- * @param valueLoopValue the name of the loop variable that is used when iterating over the value
- *                       collection, and which is used as input for the `valueLambdaFunction`
- * @param valueLoopIsNull the nullability of the loop variable that is used when iterating over
- *                        the value collection, and which is used as input for the
- *                        `valueLambdaFunction`
+ * @param valueLoopVar the [[LambdaVariable]] expression representing the loop variable that is used
+ *                     when iterating over the value collection, and which is used as input for the
+ *                     `valueLambdaFunction`.
  * @param valueLambdaFunction A function that takes the `valueLoopVar` as input, and is used as
  *                            a lambda function to handle collection elements.
  * @param inputData An expression that when evaluated returns a map object.
  * @param collClass The type of the resulting collection.
  */
 case class CatalystToExternalMap private(
-    keyLoopValue: String,
+    keyLoopVar: LambdaVariable,
     keyLambdaFunction: Expression,
-    valueLoopValue: String,
-    valueLoopIsNull: String,
+    valueLoopVar: LambdaVariable,
     valueLambdaFunction: Expression,
     inputData: Expression,
     collClass: Class[_]) extends Expression with NonSQLExpression {
 
   override def nullable: Boolean = inputData.nullable
 
-  override def children: Seq[Expression] =
-    keyLambdaFunction :: valueLambdaFunction :: inputData :: Nil
+  override def children: Seq[Expression] = Seq(
+    keyLoopVar, keyLambdaFunction, valueLoopVar, valueLambdaFunction, inputData)
 
-  override def eval(input: InternalRow): Any =
-    throw new UnsupportedOperationException("Only code-generated evaluation is supported")
+  private lazy val inputMapType = inputData.dataType.asInstanceOf[MapType]
+
+  private lazy val keyConverter =
+    CatalystTypeConverters.createToScalaConverter(inputMapType.keyType)
+  private lazy val valueConverter =
+    CatalystTypeConverters.createToScalaConverter(inputMapType.valueType)
+
+  private lazy val (newMapBuilderMethod, moduleField) = {
+    val clazz = Utils.classForName(collClass.getCanonicalName + "$")
+    (clazz.getMethod("newBuilder"), clazz.getField("MODULE$").get(null))
+  }
+
+  private def newMapBuilder(): Builder[AnyRef, AnyRef] = {
+    newMapBuilderMethod.invoke(moduleField).asInstanceOf[Builder[AnyRef, AnyRef]]
+  }
+
+  override def eval(input: InternalRow): Any = {
+    val result = inputData.eval(input).asInstanceOf[MapData]
+    if (result != null) {
+      val builder = newMapBuilder()
+      builder.sizeHint(result.numElements())
+      val keyArray = result.keyArray()
+      val valueArray = result.valueArray()
+      var i = 0
+      while (i < result.numElements()) {
+        val key = keyConverter(keyArray.get(i, inputMapType.keyType))
+        val value = valueConverter(valueArray.get(i, inputMapType.valueType))
+        builder += Tuple2(key, value)
+        i += 1
+      }
+      builder.result()
+    } else {
+      null
+    }
+  }
 
   override def dataType: DataType = ObjectType(collClass)
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    // The data with PythonUserDefinedType are actually stored with the data type of its sqlType.
-    // When we want to apply MapObjects on it, we have to use it.
-    def inputDataType(dataType: DataType) = dataType match {
-      case p: PythonUserDefinedType => p.sqlType
-      case _ => dataType
-    }
-
-    val mapType = inputDataType(inputData.dataType).asInstanceOf[MapType]
-    val keyElementJavaType = CodeGenerator.javaType(mapType.keyType)
-    ctx.addMutableState(keyElementJavaType, keyLoopValue, forceInline = true, useFreshName = false)
+    val keyCode = LambdaVariable.prepareLambdaVariable(ctx, keyLoopVar)
+    val valueCode = LambdaVariable.prepareLambdaVariable(ctx, valueLoopVar)
+    val keyElementJavaType = CodeGenerator.javaType(keyLoopVar.dataType)
     val genKeyFunction = keyLambdaFunction.genCode(ctx)
-    val valueElementJavaType = CodeGenerator.javaType(mapType.valueType)
-    ctx.addMutableState(valueElementJavaType, valueLoopValue, forceInline = true,
-      useFreshName = false)
+    val valueElementJavaType = CodeGenerator.javaType(valueLoopVar.dataType)
     val genValueFunction = valueLambdaFunction.genCode(ctx)
     val genInputData = inputData.genCode(ctx)
     val dataLength = ctx.freshName("dataLength")
@@ -1031,17 +1138,10 @@ case class CatalystToExternalMap private(
     val tupleLoopValue = ctx.freshName("tupleLoopValue")
     val builderValue = ctx.freshName("builderValue")
 
-    val getLength = s"${genInputData.value}.numElements()"
-
     val keyArray = ctx.freshName("keyArray")
     val valueArray = ctx.freshName("valueArray")
-    val getKeyArray =
-      s"${classOf[ArrayData].getName} $keyArray = ${genInputData.value}.keyArray();"
-    val getKeyLoopVar = CodeGenerator.getValue(keyArray, inputDataType(mapType.keyType), loopIndex)
-    val getValueArray =
-      s"${classOf[ArrayData].getName} $valueArray = ${genInputData.value}.valueArray();"
-    val getValueLoopVar = CodeGenerator.getValue(
-      valueArray, inputDataType(mapType.valueType), loopIndex)
+    val getKeyLoopVar = CodeGenerator.getValue(keyArray, keyLoopVar.dataType, loopIndex)
+    val getValueLoopVar = CodeGenerator.getValue(valueArray, valueLoopVar.dataType, loopIndex)
 
     // Make a copy of the data if it's unsafe-backed
     def makeCopyIfInstanceOf(clazz: Class[_ <: Any], value: String) =
@@ -1056,10 +1156,8 @@ case class CatalystToExternalMap private(
     val genKeyFunctionValue = genFunctionValue(keyLambdaFunction, genKeyFunction)
     val genValueFunctionValue = genFunctionValue(valueLambdaFunction, genValueFunction)
 
-    val valueLoopNullCheck = if (valueLoopIsNull != "false") {
-      ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, valueLoopIsNull, forceInline = true,
-        useFreshName = false)
-      s"$valueLoopIsNull = $valueArray.isNullAt($loopIndex);"
+    val valueLoopNullCheck = if (valueLoopVar.nullable) {
+      s"${valueCode.isNull} = $valueArray.isNullAt($loopIndex);"
     } else {
       ""
     }
@@ -1084,20 +1182,19 @@ case class CatalystToExternalMap private(
      """
     val getBuilderResult = s"${ev.value} = (${collClass.getName}) $builderValue.result();"
 
-    val code = s"""
-      ${genInputData.code}
+    val code = genInputData.code + code"""
       ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
 
       if (!${genInputData.isNull}) {
-        int $dataLength = $getLength;
+        int $dataLength = ${genInputData.value}.numElements();
         $constructBuilder
-        $getKeyArray
-        $getValueArray
+        ArrayData $keyArray = ${genInputData.value}.keyArray();
+        ArrayData $valueArray = ${genInputData.value}.valueArray();
 
         int $loopIndex = 0;
         while ($loopIndex < $dataLength) {
-          $keyLoopValue = ($keyElementJavaType) ($getKeyLoopVar);
-          $valueLoopValue = ($valueElementJavaType) ($getValueLoopVar);
+          ${keyCode.value} = ($keyElementJavaType) ($getKeyLoopVar);
+          ${valueCode.value} = ($valueElementJavaType) ($getValueLoopVar);
           $valueLoopNullCheck
 
           ${genKeyFunction.code}
@@ -1116,8 +1213,6 @@ case class CatalystToExternalMap private(
 }
 
 object ExternalMapToCatalyst {
-  private val curId = new java.util.concurrent.atomic.AtomicInteger()
-
   def apply(
       inputMap: Expression,
       keyType: DataType,
@@ -1126,31 +1221,14 @@ object ExternalMapToCatalyst {
       valueType: DataType,
       valueConverter: Expression => Expression,
       valueNullable: Boolean): ExternalMapToCatalyst = {
-    val id = curId.getAndIncrement()
-    val keyName = "ExternalMapToCatalyst_key" + id
-    val keyIsNull = if (keyNullable) {
-      "ExternalMapToCatalyst_key_isNull" + id
-    } else {
-      "false"
-    }
-    val valueName = "ExternalMapToCatalyst_value" + id
-    val valueIsNull = if (valueNullable) {
-      "ExternalMapToCatalyst_value_isNull" + id
-    } else {
-      "false"
-    }
-
+    val keyLoopVar = LambdaVariable("ExternalMapToCatalyst_key", keyType, keyNullable)
+    val valueLoopVar = LambdaVariable("ExternalMapToCatalyst_value", valueType, valueNullable)
     ExternalMapToCatalyst(
-      keyName,
-      keyIsNull,
-      keyType,
-      keyConverter(LambdaVariable(keyName, keyIsNull, keyType, keyNullable)),
-      valueName,
-      valueIsNull,
-      valueType,
-      valueConverter(LambdaVariable(valueName, valueIsNull, valueType, valueNullable)),
-      inputMap
-    )
+      keyLoopVar,
+      keyConverter(keyLoopVar),
+      valueLoopVar,
+      valueConverter(valueLoopVar),
+      inputMap)
   }
 }
 
@@ -1158,45 +1236,104 @@ object ExternalMapToCatalyst {
  * Converts a Scala/Java map object into catalyst format, by applying the key/value converter when
  * iterate the map.
  *
- * @param key the name of the map key variable that used when iterate the map, and used as input for
- *            the `keyConverter`
- * @param keyIsNull the nullability of the map key variable that used when iterate the map, and
- *                  used as input for the `keyConverter`
- * @param keyType the data type of the map key variable that used when iterate the map, and used as
- *                input for the `keyConverter`
+ * @param keyLoopVar the [[LambdaVariable]] expression representing the loop variable that is used
+ *                   when iterating over the key collection, and which is used as input for the
+ *                   `keyConverter`.
  * @param keyConverter A function that take the `key` as input, and converts it to catalyst format.
- * @param value the name of the map value variable that used when iterate the map, and used as input
- *              for the `valueConverter`
- * @param valueIsNull the nullability of the map value variable that used when iterate the map, and
- *                    used as input for the `valueConverter`
- * @param valueType the data type of the map value variable that used when iterate the map, and
- *                  used as input for the `valueConverter`
+ * @param valueLoopVar the [[LambdaVariable]] expression representing the loop variable that is used
+ *                     when iterating over the value collection, and which is used as input for the
+ *                     `valueConverter`.
  * @param valueConverter A function that take the `value` as input, and converts it to catalyst
  *                       format.
- * @param child An expression that when evaluated returns the input map object.
+ * @param inputData An expression that when evaluated returns the input map object.
  */
 case class ExternalMapToCatalyst private(
-    key: String,
-    keyIsNull: String,
-    keyType: DataType,
+    keyLoopVar: LambdaVariable,
     keyConverter: Expression,
-    value: String,
-    valueIsNull: String,
-    valueType: DataType,
+    valueLoopVar: LambdaVariable,
     valueConverter: Expression,
-    child: Expression)
-  extends UnaryExpression with NonSQLExpression {
+    inputData: Expression)
+  extends Expression with NonSQLExpression {
 
   override def foldable: Boolean = false
+
+  override def nullable: Boolean = inputData.nullable
+
+  override def children: Seq[Expression] = Seq(
+    keyLoopVar, keyConverter, valueLoopVar, valueConverter, inputData)
 
   override def dataType: MapType = MapType(
     keyConverter.dataType, valueConverter.dataType, valueContainsNull = valueConverter.nullable)
 
-  override def eval(input: InternalRow): Any =
-    throw new UnsupportedOperationException("Only code-generated evaluation is supported")
+  private lazy val mapCatalystConverter: Any => (Array[Any], Array[Any]) = {
+    val rowBuffer = InternalRow.fromSeq(Array[Any](1))
+    def rowWrapper(data: Any): InternalRow = {
+      rowBuffer.update(0, data)
+      rowBuffer
+    }
+
+    inputData.dataType match {
+      case ObjectType(cls) if classOf[java.util.Map[_, _]].isAssignableFrom(cls) =>
+        (input: Any) => {
+          val data = input.asInstanceOf[java.util.Map[Any, Any]]
+          val keys = new Array[Any](data.size)
+          val values = new Array[Any](data.size)
+          val iter = data.entrySet().iterator()
+          var i = 0
+          while (iter.hasNext) {
+            val entry = iter.next()
+            val (key, value) = (entry.getKey, entry.getValue)
+            keys(i) = if (key != null) {
+              keyConverter.eval(rowWrapper(key))
+            } else {
+              throw QueryExecutionErrors.nullAsMapKeyNotAllowedError
+            }
+            values(i) = if (value != null) {
+              valueConverter.eval(rowWrapper(value))
+            } else {
+              null
+            }
+            i += 1
+          }
+          (keys, values)
+        }
+
+      case ObjectType(cls) if classOf[scala.collection.Map[_, _]].isAssignableFrom(cls) =>
+        (input: Any) => {
+          val data = input.asInstanceOf[scala.collection.Map[Any, Any]]
+          val keys = new Array[Any](data.size)
+          val values = new Array[Any](data.size)
+          var i = 0
+          for ((key, value) <- data) {
+            keys(i) = if (key != null) {
+              keyConverter.eval(rowWrapper(key))
+            } else {
+              throw QueryExecutionErrors.nullAsMapKeyNotAllowedError
+            }
+            values(i) = if (value != null) {
+              valueConverter.eval(rowWrapper(value))
+            } else {
+              null
+            }
+            i += 1
+          }
+          (keys, values)
+        }
+    }
+  }
+
+  override def eval(input: InternalRow): Any = {
+    val result = inputData.eval(input)
+    if (result != null) {
+      val (keys, values) = mapCatalystConverter(result)
+      new ArrayBasedMapData(new GenericArrayData(keys), new GenericArrayData(values))
+    } else {
+      null
+    }
+  }
 
   override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    val inputMap = child.genCode(ctx)
+    val inputMap = inputData.genCode(ctx)
     val genKeyConverter = keyConverter.genCode(ctx)
     val genValueConverter = valueConverter.genCode(ctx)
     val length = ctx.freshName("length")
@@ -1206,12 +1343,12 @@ case class ExternalMapToCatalyst private(
     val entry = ctx.freshName("entry")
     val entries = ctx.freshName("entries")
 
-    val keyElementJavaType = CodeGenerator.javaType(keyType)
-    val valueElementJavaType = CodeGenerator.javaType(valueType)
-    ctx.addMutableState(keyElementJavaType, key, forceInline = true, useFreshName = false)
-    ctx.addMutableState(valueElementJavaType, value, forceInline = true, useFreshName = false)
+    val keyJavaType = CodeGenerator.javaType(keyLoopVar.dataType)
+    val valueJavaType = CodeGenerator.javaType(valueLoopVar.dataType)
+    val keyCode = LambdaVariable.prepareLambdaVariable(ctx, keyLoopVar)
+    val valueCode = LambdaVariable.prepareLambdaVariable(ctx, valueLoopVar)
 
-    val (defineEntries, defineKeyValue) = child.dataType match {
+    val (defineEntries, defineKeyValue) = inputData.dataType match {
       case ObjectType(cls) if classOf[java.util.Map[_, _]].isAssignableFrom(cls) =>
         val javaIteratorCls = classOf[java.util.Iterator[_]].getName
         val javaMapEntryCls = classOf[java.util.Map.Entry[_, _]].getName
@@ -1222,8 +1359,8 @@ case class ExternalMapToCatalyst private(
         val defineKeyValue =
           s"""
             final $javaMapEntryCls $entry = ($javaMapEntryCls) $entries.next();
-            $key = (${CodeGenerator.boxedType(keyType)}) $entry.getKey();
-            $value = (${CodeGenerator.boxedType(valueType)}) $entry.getValue();
+            ${keyCode.value} = (${CodeGenerator.boxedType(keyJavaType)}) $entry.getKey();
+            ${valueCode.value} = (${CodeGenerator.boxedType(valueJavaType)}) $entry.getValue();
           """
 
         defineEntries -> defineKeyValue
@@ -1237,25 +1374,21 @@ case class ExternalMapToCatalyst private(
         val defineKeyValue =
           s"""
             final $scalaMapEntryCls $entry = ($scalaMapEntryCls) $entries.next();
-            $key = (${CodeGenerator.boxedType(keyType)}) $entry._1();
-            $value = (${CodeGenerator.boxedType(valueType)}) $entry._2();
+            ${keyCode.value} = (${CodeGenerator.boxedType(keyJavaType)}) $entry._1();
+            ${valueCode.value} = (${CodeGenerator.boxedType(valueJavaType)}) $entry._2();
           """
 
         defineEntries -> defineKeyValue
     }
 
-    val keyNullCheck = if (keyIsNull != "false") {
-      ctx.addMutableState(
-        CodeGenerator.JAVA_BOOLEAN, keyIsNull, forceInline = true, useFreshName = false)
-      s"$keyIsNull = $key == null;"
+    val keyNullCheck = if (keyLoopVar.nullable) {
+      s"${keyCode.isNull} = ${keyCode.value} == null;"
     } else {
       ""
     }
 
-    val valueNullCheck = if (valueIsNull != "false") {
-      ctx.addMutableState(
-        CodeGenerator.JAVA_BOOLEAN, valueIsNull, forceInline = true, useFreshName = false)
-      s"$valueIsNull = $value == null;"
+    val valueNullCheck = if (valueLoopVar.nullable) {
+      s"${valueCode.isNull} = ${valueCode.value} == null;"
     } else {
       ""
     }
@@ -1264,9 +1397,8 @@ case class ExternalMapToCatalyst private(
     val mapCls = classOf[ArrayBasedMapData].getName
     val convertedKeyType = CodeGenerator.boxedType(keyConverter.dataType)
     val convertedValueType = CodeGenerator.boxedType(valueConverter.dataType)
-    val code =
-      s"""
-        ${inputMap.code}
+    val code = inputMap.code +
+      code"""
         ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
         if (!${inputMap.isNull}) {
           final int $length = ${inputMap.value}.size();
@@ -1281,7 +1413,7 @@ case class ExternalMapToCatalyst private(
 
             ${genKeyConverter.code}
             if (${genKeyConverter.isNull}) {
-              throw new RuntimeException("Cannot use null as map key!");
+              throw QueryExecutionErrors.nullAsMapKeyNotAllowedError();
             } else {
               $convertedKeys[$index] = ($convertedKeyType) ${genKeyConverter.value};
             }
@@ -1344,7 +1476,7 @@ case class CreateExternalRow(children: Seq[Expression], schema: StructType)
     val schemaField = ctx.addReferenceObj("schema", schema)
 
     val code =
-      s"""
+      code"""
          |Object[] $values = new Object[${children.size}];
          |$childrenCode
          |final ${classOf[Row].getName} ${ev.value} = new $rowClass($values, $schemaField);
@@ -1372,8 +1504,7 @@ case class EncodeUsingSerializer(child: Expression, kryo: Boolean)
     val javaType = CodeGenerator.javaType(dataType)
     val serialize = s"$serializer.serialize(${input.value}, null).array()"
 
-    val code = s"""
-      ${input.code}
+    val code = input.code + code"""
       final $javaType ${ev.value} =
         ${input.isNull} ? ${CodeGenerator.defaultValue(dataType)} : $serialize;
      """
@@ -1405,8 +1536,7 @@ case class DecodeUsingSerializer[T](child: Expression, tag: ClassTag[T], kryo: B
     val deserialize =
       s"($javaType) $serializer.deserialize(java.nio.ByteBuffer.wrap(${input.value}), null)"
 
-    val code = s"""
-      ${input.code}
+    val code = input.code + code"""
       final $javaType ${ev.value} =
          ${input.isNull} ? ${CodeGenerator.defaultValue(dataType)} : $deserialize;
      """
@@ -1443,8 +1573,7 @@ case class InitializeJavaBean(beanInstance: Expression, setters: Map[String, Exp
           }
         }
         if (methods.isEmpty) {
-          throw new NoSuchMethodException(s"""A method named "$name" is not declared """ +
-            "in any enclosing class nor any supertype")
+          throw QueryExecutionErrors.methodNotDeclaredError(name)
         }
         methods.head -> expr
     }
@@ -1487,9 +1616,8 @@ case class InitializeJavaBean(beanInstance: Expression, setters: Map[String, Exp
       funcName = "initializeJavaBean",
       extraArguments = beanInstanceJavaType -> javaBeanInstance :: Nil)
 
-    val code =
-      s"""
-         |${instanceGen.code}
+    val code = instanceGen.code +
+      code"""
          |$beanInstanceJavaType $javaBeanInstance = ${instanceGen.value};
          |if (!${instanceGen.isNull}) {
          |  $initializeCode
@@ -1537,9 +1665,7 @@ case class AssertNotNull(child: Expression, walkedTypePath: Seq[String] = Nil)
     // because errMsgField is used only when the value is null.
     val errMsgField = ctx.addReferenceObj("errMsg", errMsg)
 
-    val code = s"""
-      ${childGen.code}
-
+    val code = childGen.code + code"""
       if (${childGen.isNull}) {
         throw new NullPointerException($errMsgField);
       }
@@ -1564,15 +1690,15 @@ case class GetExternalRowField(
 
   override def dataType: DataType = ObjectType(classOf[Object])
 
-  private val errMsg = s"The ${index}th field '$fieldName' of input row cannot be null."
+  private val errMsg = QueryExecutionErrors.fieldCannotBeNullMsg(index, fieldName)
 
   override def eval(input: InternalRow): Any = {
     val inputRow = child.eval(input).asInstanceOf[Row]
     if (inputRow == null) {
-      throw new RuntimeException("The input external row cannot be null.")
+      throw QueryExecutionErrors.inputExternalRowCannotBeNullError
     }
     if (inputRow.isNullAt(index)) {
-      throw new RuntimeException(errMsg)
+      throw QueryExecutionErrors.fieldCannotBeNullError(index, fieldName)
     }
     inputRow.get(index)
   }
@@ -1582,11 +1708,11 @@ case class GetExternalRowField(
     // because errMsgField is used only when the field is null.
     val errMsgField = ctx.addReferenceObj("errMsg", errMsg)
     val row = child.genCode(ctx)
-    val code = s"""
+    val code = code"""
       ${row.code}
 
       if (${row.isNull}) {
-        throw new RuntimeException("The input external row cannot be null.");
+        throw QueryExecutionErrors.inputExternalRowCannotBeNullError();
       }
 
       if (${row.value}.isNullAt($index)) {
@@ -1610,12 +1736,35 @@ case class ValidateExternalType(child: Expression, expected: DataType)
 
   override def nullable: Boolean = child.nullable
 
-  override def dataType: DataType = RowEncoder.externalDataTypeForInput(expected)
+  override val dataType: DataType = RowEncoder.externalDataTypeForInput(expected)
 
-  override def eval(input: InternalRow): Any =
-    throw new UnsupportedOperationException("Only code-generated evaluation is supported")
+  private lazy val errMsg = s" is not a valid external type for schema of ${expected.simpleString}"
 
-  private val errMsg = s" is not a valid external type for schema of ${expected.simpleString}"
+  private lazy val checkType: (Any) => Boolean = expected match {
+    case _: DecimalType =>
+      (value: Any) => {
+        value.isInstanceOf[java.math.BigDecimal] || value.isInstanceOf[scala.math.BigDecimal] ||
+          value.isInstanceOf[Decimal]
+      }
+    case _: ArrayType =>
+      (value: Any) => {
+        value.getClass.isArray || value.isInstanceOf[Seq[_]]
+      }
+    case _ =>
+      val dataTypeClazz = ScalaReflection.javaBoxedType(dataType)
+      (value: Any) => {
+        dataTypeClazz.isInstance(value)
+      }
+  }
+
+  override def eval(input: InternalRow): Any = {
+    val result = child.eval(input)
+    if (checkType(result)) {
+      result
+    } else {
+      throw new RuntimeException(s"${result.getClass.getName}$errMsg")
+    }
+  }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     // Use unnamed reference that doesn't create a local field here to reduce the number of fields
@@ -1629,12 +1778,12 @@ case class ValidateExternalType(child: Expression, expected: DataType)
         Seq(classOf[java.math.BigDecimal], classOf[scala.math.BigDecimal], classOf[Decimal])
           .map(cls => s"$obj instanceof ${cls.getName}").mkString(" || ")
       case _: ArrayType =>
-        s"$obj instanceof ${classOf[Seq[_]].getName} || $obj.getClass().isArray()"
+        s"$obj.getClass().isArray() || $obj instanceof ${classOf[scala.collection.Seq[_]].getName}"
       case _ =>
         s"$obj instanceof ${CodeGenerator.boxedType(dataType)}"
     }
 
-    val code = s"""
+    val code = code"""
       ${input.code}
       ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
       if (!${input.isNull}) {

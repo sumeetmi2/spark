@@ -17,6 +17,8 @@
 
 package org.apache.spark.ml.classification
 
+import org.scalatest.Assertions._
+
 import org.apache.spark.ml.attribute.NominalAttribute
 import org.apache.spark.ml.classification.LogisticRegressionSuite._
 import org.apache.spark.ml.feature.LabeledPoint
@@ -72,12 +74,15 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
       .setClassifier(new LogisticRegression)
     assert(ova.getLabelCol === "label")
     assert(ova.getPredictionCol === "prediction")
+    assert(ova.getRawPredictionCol === "rawPrediction")
     val ovaModel = ova.fit(dataset)
 
     MLTestingUtils.checkCopyAndUids(ova, ovaModel)
 
-    assert(ovaModel.models.length === numClasses)
+    assert(ovaModel.numClasses === numClasses)
     val transformedDataset = ovaModel.transform(dataset)
+    checkNominalOnDF(transformedDataset, "prediction", ovaModel.numClasses)
+    checkVectorSizeOnDF(transformedDataset, "rawPrediction", ovaModel.numClasses)
 
     // check for label metadata in prediction col
     val predictionColSchema = transformedDataset.schema(ovaModel.getPredictionCol)
@@ -133,8 +138,8 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
         assert(lrModel1.coefficients ~== lrModel2.coefficients relTol 1E-3)
         assert(lrModel1.intercept ~== lrModel2.intercept relTol 1E-3)
       case other =>
-        throw new AssertionError(s"Loaded OneVsRestModel expected model of type" +
-          s" LogisticRegressionModel but found ${other.getClass.getName}")
+        fail("Loaded OneVsRestModel expected model of type LogisticRegressionModel " +
+          s"but found ${other.getClass.getName}")
     }
   }
 
@@ -179,6 +184,7 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     val dataset2 = dataset.select(col("label").as("y"), col("features").as("fea"))
     ovaModel.setFeaturesCol("fea")
     ovaModel.setPredictionCol("pred")
+    ovaModel.setRawPredictionCol("")
     val transformedDataset = ovaModel.transform(dataset2)
     val outputFields = transformedDataset.schema.fieldNames.toSet
     assert(outputFields === Set("y", "fea", "pred"))
@@ -190,7 +196,8 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     val ovr = new OneVsRest()
       .setClassifier(logReg)
     val output = ovr.fit(dataset).transform(dataset)
-    assert(output.schema.fieldNames.toSet === Set("label", "features", "prediction"))
+    assert(output.schema.fieldNames.toSet
+      === Set("label", "features", "prediction", "rawPrediction"))
   }
 
   test("SPARK-21306: OneVsRest should support setWeightCol") {
@@ -199,8 +206,28 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     val ova = new OneVsRest().setWeightCol("weight").setClassifier(new LogisticRegression())
     assert(ova.fit(dataset2) !== null)
     // classifier doesn't inherit hasWeightCol
-    val ova2 = new OneVsRest().setWeightCol("weight").setClassifier(new DecisionTreeClassifier())
+    val ova2 = new OneVsRest().setWeightCol("weight").setClassifier(new FMClassifier())
     assert(ova2.fit(dataset2) !== null)
+  }
+
+  test("SPARK-34045: OneVsRestModel.transform should not call setter of submodels") {
+    val logReg = new LogisticRegression().setMaxIter(1)
+    val ovr = new OneVsRest().setClassifier(logReg)
+    val ovrm = ovr.fit(dataset)
+    val dataset2 = dataset.withColumnRenamed("features", "features2")
+    ovrm.setFeaturesCol("features2")
+
+    val oldCols = ovrm.models.map(_.getFeaturesCol)
+    ovrm.transform(dataset2)
+    val newCols = ovrm.models.map(_.getFeaturesCol)
+    assert(oldCols === newCols)
+  }
+
+  test("SPARK-34356: OneVsRestModel.transform should avoid potential column conflict") {
+    val logReg = new LogisticRegression().setMaxIter(1)
+    val ovr = new OneVsRest().setClassifier(logReg)
+    val ovrm = ovr.fit(dataset)
+    assert(ovrm.transform(dataset.withColumn("probability", lit(0.0))).count() === dataset.count())
   }
 
   test("OneVsRest.copy and OneVsRestModel.copy") {
@@ -244,8 +271,8 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
         assert(lr.getMaxIter === lr2.getMaxIter)
         assert(lr.getRegParam === lr2.getRegParam)
       case other =>
-        throw new AssertionError(s"Loaded OneVsRest expected classifier of type" +
-          s" LogisticRegression but found ${other.getClass.getName}")
+        fail("Loaded OneVsRest expected classifier of type LogisticRegression" +
+          s" but found ${other.getClass.getName}")
     }
   }
 
@@ -264,8 +291,8 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
           assert(classifier.getMaxIter === lr2.getMaxIter)
           assert(classifier.getRegParam === lr2.getRegParam)
         case other =>
-          throw new AssertionError(s"Loaded OneVsRestModel expected classifier of type" +
-            s" LogisticRegression but found ${other.getClass.getName}")
+          fail("Loaded OneVsRestModel expected classifier of type LogisticRegression" +
+            s" but found ${other.getClass.getName}")
       }
 
       assert(model.labelMetadata === model2.labelMetadata)
@@ -275,8 +302,8 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
           assert(lrModel1.coefficients === lrModel2.coefficients)
           assert(lrModel1.intercept === lrModel2.intercept)
         case other =>
-          throw new AssertionError(s"Loaded OneVsRestModel expected model of type" +
-            s" LogisticRegressionModel but found ${other.getClass.getName}")
+          fail(s"Loaded OneVsRestModel expected model of type LogisticRegressionModel" +
+            s" but found ${other.getClass.getName}")
       }
     }
 
@@ -285,6 +312,32 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     val ovaModel = ova.fit(dataset)
     val newOvaModel = testDefaultReadWrite(ovaModel, testParams = false)
     checkModelData(ovaModel, newOvaModel)
+  }
+
+  test("should ignore empty output cols") {
+    val lr = new LogisticRegression().setMaxIter(1)
+    val ovr = new OneVsRest().setClassifier(lr)
+    val ovrModel = ovr.fit(dataset)
+
+    val output1 = ovrModel.setPredictionCol("").setRawPredictionCol("")
+      .transform(dataset)
+    assert(output1.schema.fieldNames.toSet ===
+      Set("label", "features"))
+
+    val output2 = ovrModel.setPredictionCol("prediction").setRawPredictionCol("")
+      .transform(dataset)
+    assert(output2.schema.fieldNames.toSet ===
+      Set("label", "features", "prediction"))
+
+    val output3 = ovrModel.setPredictionCol("").setRawPredictionCol("rawPrediction")
+      .transform(dataset)
+    assert(output3.schema.fieldNames.toSet ===
+      Set("label", "features", "rawPrediction"))
+
+    val output4 = ovrModel.setPredictionCol("prediction").setRawPredictionCol("rawPrediction")
+      .transform(dataset)
+    assert(output4.schema.fieldNames.toSet ===
+      Set("label", "features", "prediction", "rawPrediction"))
   }
 
   test("should support all NumericType labels and not support other types") {

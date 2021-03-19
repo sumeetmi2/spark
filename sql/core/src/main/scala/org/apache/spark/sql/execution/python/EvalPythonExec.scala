@@ -21,12 +21,12 @@ import java.io.File
 
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.spark.{SparkEnv, TaskContext}
+import org.apache.spark.{ContextAwareIterator, SparkEnv, TaskContext}
 import org.apache.spark.api.python.ChainedPythonFunctions
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.UnaryExecNode
 import org.apache.spark.sql.types.{DataType, StructField, StructType}
 import org.apache.spark.util.Utils
 
@@ -57,12 +57,13 @@ import org.apache.spark.util.Utils
  * there should be always some rows buffered in the socket or Python process, so the pulling from
  * RowQueue ALWAYS happened after pushing into it.
  */
-abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], child: SparkPlan)
-  extends SparkPlan {
+trait EvalPythonExec extends UnaryExecNode {
+  def udfs: Seq[PythonUDF]
+  def resultAttrs: Seq[Attribute]
 
-  def children: Seq[SparkPlan] = child :: Nil
+  override def output: Seq[Attribute] = child.output ++ resultAttrs
 
-  override def producedAttributes: AttributeSet = AttributeSet(output.drop(child.output.length))
+  override def producedAttributes: AttributeSet = AttributeSet(resultAttrs)
 
   private def collectFunctions(udf: PythonUDF): (ChainedPythonFunctions, Seq[Expression]) = {
     udf.children match {
@@ -78,8 +79,6 @@ abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], chil
 
   protected def evaluate(
       funcs: Seq[ChainedPythonFunctions],
-      bufferSize: Int,
-      reuseWorker: Boolean,
       argOffsets: Array[Array[Int]],
       iter: Iterator[InternalRow],
       schema: StructType,
@@ -87,17 +86,16 @@ abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], chil
 
   protected override def doExecute(): RDD[InternalRow] = {
     val inputRDD = child.execute().map(_.copy())
-    val bufferSize = inputRDD.conf.getInt("spark.buffer.size", 65536)
-    val reuseWorker = inputRDD.conf.getBoolean("spark.python.worker.reuse", defaultValue = true)
 
     inputRDD.mapPartitions { iter =>
       val context = TaskContext.get()
+      val contextAwareIterator = new ContextAwareIterator(context, iter)
 
       // The queue used to buffer input rows so we can drain it to
       // combine input with output from Python.
       val queue = HybridRowQueue(context.taskMemoryManager(),
         new File(Utils.getLocalDir(SparkEnv.get.conf)), child.output.length)
-      context.addTaskCompletionListener { ctx =>
+      context.addTaskCompletionListener[Unit] { ctx =>
         queue.close()
       }
 
@@ -117,19 +115,19 @@ abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], chil
           }
         }.toArray
       }.toArray
-      val projection = newMutableProjection(allInputs, child.output)
+      val projection = MutableProjection.create(allInputs.toSeq, child.output)
       val schema = StructType(dataTypes.zipWithIndex.map { case (dt, i) =>
         StructField(s"_$i", dt)
-      })
+      }.toSeq)
 
       // Add rows to queue to join later with the result.
-      val projectedRowIter = iter.map { inputRow =>
+      val projectedRowIter = contextAwareIterator.map { inputRow =>
         queue.add(inputRow.asInstanceOf[UnsafeRow])
         projection(inputRow)
       }
 
       val outputRowIterator = evaluate(
-        pyFuncs, bufferSize, reuseWorker, argOffsets, projectedRowIter, schema, context)
+        pyFuncs, argOffsets, projectedRowIter, schema, context)
 
       val joined = new JoinedRow
       val resultProj = UnsafeProjection.create(output, output)

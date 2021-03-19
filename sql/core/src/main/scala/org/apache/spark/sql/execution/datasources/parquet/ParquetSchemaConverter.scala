@@ -26,7 +26,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName._
 import org.apache.parquet.schema.Type.Repetition._
 
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaConverter.maxPrecisionForBytes
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
@@ -80,7 +80,7 @@ class ParquetToSparkSchemaConverter(
       }
     }
 
-    StructType(fields)
+    StructType(fields.toSeq)
   }
 
   /**
@@ -99,13 +99,13 @@ class ParquetToSparkSchemaConverter(
       if (originalType == null) s"$typeName" else s"$typeName ($originalType)"
 
     def typeNotSupported() =
-      throw new AnalysisException(s"Parquet type not supported: $typeString")
+      throw QueryCompilationErrors.parquetTypeUnsupportedError(typeString)
 
     def typeNotImplemented() =
-      throw new AnalysisException(s"Parquet type not yet supported: $typeString")
+      throw QueryCompilationErrors.parquetTypeUnsupportedYetError(typeString)
 
     def illegalType() =
-      throw new AnalysisException(s"Illegal Parquet type: $typeString")
+      throw QueryCompilationErrors.illegalParquetTypeError(typeString)
 
     // When maxPrecision = -1, we skip precision range check, and always respect the precision
     // specified in field.getDecimalMetadata.  This is useful when interpreting decimal types stored
@@ -171,7 +171,7 @@ class ParquetToSparkSchemaConverter(
 
       case FIXED_LEN_BYTE_ARRAY =>
         originalType match {
-          case DECIMAL => makeDecimalType(maxPrecisionForBytes(field.getTypeLength))
+          case DECIMAL => makeDecimalType(Decimal.maxPrecisionForBytes(field.getTypeLength))
           case INTERVAL => typeNotImplemented()
           case _ => illegalType()
         }
@@ -226,10 +226,6 @@ class ParquetToSparkSchemaConverter(
           s"Invalid map type: $field")
 
         val keyType = keyValueType.getType(0)
-        ParquetSchemaConverter.checkConversionRequirement(
-          keyType.isPrimitive,
-          s"Map key type is expected to be a primitive type, but found: $keyType")
-
         val valueType = keyValueType.getType(1)
         val valueOptional = valueType.isRepetition(OPTIONAL)
         MapType(
@@ -238,7 +234,7 @@ class ParquetToSparkSchemaConverter(
           valueContainsNull = valueOptional)
 
       case _ =>
-        throw new AnalysisException(s"Unrecognized Parquet type: $field")
+        throw QueryCompilationErrors.unrecognizedParquetTypeError(field.toString)
     }
   }
 
@@ -411,7 +407,7 @@ class SparkToParquetSchemaConverter(
           .as(DECIMAL)
           .precision(precision)
           .scale(scale)
-          .length(ParquetSchemaConverter.minBytesForPrecision(precision))
+          .length(Decimal.minBytesForPrecision(precision))
           .named(field.name)
 
       // ========================
@@ -445,7 +441,7 @@ class SparkToParquetSchemaConverter(
           .as(DECIMAL)
           .precision(precision)
           .scale(scale)
-          .length(ParquetSchemaConverter.minBytesForPrecision(precision))
+          .length(Decimal.minBytesForPrecision(precision))
           .named(field.name)
 
       // ===================================
@@ -555,7 +551,7 @@ class SparkToParquetSchemaConverter(
         convertField(field.copy(dataType = udt.sqlType))
 
       case _ =>
-        throw new AnalysisException(s"Unsupported data type $field.dataType")
+        throw QueryCompilationErrors.cannotConvertDataTypeToParquetTypeError(field)
     }
   }
 }
@@ -583,24 +579,5 @@ private[sql] object ParquetSchemaConverter {
     if (!f) {
       throw new AnalysisException(message)
     }
-  }
-
-  private def computeMinBytesForPrecision(precision : Int) : Int = {
-    var numBytes = 1
-    while (math.pow(2.0, 8 * numBytes - 1) < math.pow(10.0, precision)) {
-      numBytes += 1
-    }
-    numBytes
-  }
-
-  // Returns the minimum number of bytes needed to store a decimal with a given `precision`.
-  val minBytesForPrecision = Array.tabulate[Int](39)(computeMinBytesForPrecision)
-
-  // Max precision of a decimal value stored in `numBytes` bytes
-  def maxPrecisionForBytes(numBytes: Int): Int = {
-    Math.round(                               // convert double to long
-      Math.floor(Math.log10(                  // number of base-10 digits
-        Math.pow(2, 8 * numBytes - 1) - 1)))  // max value stored in numBytes
-      .asInstanceOf[Int]
   }
 }

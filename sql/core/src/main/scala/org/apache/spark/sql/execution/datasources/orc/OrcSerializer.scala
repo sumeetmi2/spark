@@ -20,12 +20,11 @@ package org.apache.spark.sql.execution.datasources.orc
 import org.apache.hadoop.io._
 import org.apache.orc.TypeDescription
 import org.apache.orc.mapred.{OrcList, OrcMap, OrcStruct, OrcTimestamp}
-import org.apache.orc.storage.common.`type`.HiveDecimal
-import org.apache.orc.storage.serde2.io.{DateWritable, HiveDecimalWritable}
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.catalyst.util._
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 /**
@@ -139,14 +138,7 @@ class OrcSerializer(dataSchema: StructType) {
       new BytesWritable(getter.getBinary(ordinal))
 
     case DateType =>
-      if (reuseObj) {
-        val result = new DateWritable()
-        (getter, ordinal) =>
-          result.set(getter.getInt(ordinal))
-          result
-      } else {
-        (getter, ordinal) => new DateWritable(getter.getInt(ordinal))
-      }
+      OrcShimUtils.getDateWritable(reuseObj)
 
     // The following cases are already expensive, reusing object or not doesn't matter.
 
@@ -156,9 +148,8 @@ class OrcSerializer(dataSchema: StructType) {
       result.setNanos(ts.getNanos)
       result
 
-    case DecimalType.Fixed(precision, scale) => (getter, ordinal) =>
-      val d = getter.getDecimal(ordinal, precision, scale)
-      new HiveDecimalWritable(HiveDecimal.create(d.toJavaBigDecimal))
+    case DecimalType.Fixed(precision, scale) =>
+      OrcShimUtils.getHiveDecimalWritable(precision, scale)
 
     case st: StructType => (getter, ordinal) =>
       val result = createOrcValue(st).asInstanceOf[OrcStruct]
@@ -216,13 +207,13 @@ class OrcSerializer(dataSchema: StructType) {
     case udt: UserDefinedType[_] => newConverter(udt.sqlType)
 
     case _ =>
-      throw new UnsupportedOperationException(s"$dataType is not supported yet.")
+      throw QueryExecutionErrors.dataTypeUnsupportedYetError(dataType)
   }
 
   /**
    * Return a Orc value object for the given Spark schema.
    */
   private def createOrcValue(dataType: DataType) = {
-    OrcStruct.createValue(TypeDescription.fromString(dataType.catalogString))
+    OrcStruct.createValue(TypeDescription.fromString(OrcFileFormat.getQuotedSchemaString(dataType)))
   }
 }

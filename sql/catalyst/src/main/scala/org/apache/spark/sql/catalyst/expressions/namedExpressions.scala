@@ -23,7 +23,8 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.plans.logical.EventTimeWatermark
-import org.apache.spark.sql.catalyst.util.quoteIdentifier
+import org.apache.spark.sql.catalyst.util.quoteIfNeeded
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 object NamedExpression {
@@ -40,7 +41,16 @@ object NamedExpression {
  *
  * The `id` field is unique within a given JVM, while the `uuid` is used to uniquely identify JVMs.
  */
-case class ExprId(id: Long, jvmId: UUID)
+case class ExprId(id: Long, jvmId: UUID) {
+
+  override def equals(other: Any): Boolean = other match {
+    case ExprId(id, jvmId) => this.id == id && this.jvmId == jvmId
+    case _ => false
+  }
+
+  override def hashCode(): Int = id.hashCode()
+
+}
 
 object ExprId {
   def apply(id: Long): ExprId = ExprId(id, NamedExpression.jvmId)
@@ -62,19 +72,23 @@ trait NamedExpression extends Expression {
    * multiple qualifiers, it is possible that there are other possible way to refer to this
    * attribute.
    */
-  def qualifiedName: String = (qualifier.toSeq :+ name).mkString(".")
+  def qualifiedName: String = (qualifier :+ name).mkString(".")
 
   /**
    * Optional qualifier for the expression.
+   * Qualifier can also contain the fully qualified information, for e.g, Sequence of string
+   * containing the database and the table name
    *
    * For now, since we do not allow using original table name to qualify a column name once the
    * table is aliased, this can only be:
    *
    * 1. Empty Seq: when an attribute doesn't have a qualifier,
    *    e.g. top level attributes aliased in the SELECT clause, or column from a LocalRelation.
-   * 2. Single element: either the table name or the alias name of the table.
+   * 2. Seq with a Single element: either the table name or the alias name of the table.
+   * 3. Seq with 2 elements: database name and table name
+   * 4. Seq with 3 elements: catalog name, database name and table name
    */
-  def qualifier: Option[String]
+  def qualifier: Seq[String]
 
   def toAttribute: Attribute
 
@@ -97,12 +111,14 @@ trait NamedExpression extends Expression {
 
 abstract class Attribute extends LeafExpression with NamedExpression with NullIntolerant {
 
-  override def references: AttributeSet = AttributeSet(this)
+  @transient
+  override lazy val references: AttributeSet = AttributeSet(this)
 
   def withNullability(newNullability: Boolean): Attribute
-  def withQualifier(newQualifier: Option[String]): Attribute
+  def withQualifier(newQualifier: Seq[String]): Attribute
   def withName(newName: String): Attribute
   def withMetadata(newMetadata: Metadata): Attribute
+  def withExprId(newExprId: ExprId): Attribute
 
   override def toAttribute: Attribute = this
   def newInstance(): Attribute
@@ -117,19 +133,25 @@ abstract class Attribute extends LeafExpression with NamedExpression with NullIn
  * Note that exprId and qualifiers are in a separate parameter list because
  * we only pattern match on child and name.
  *
+ * Note that when creating a new Alias, all the [[AttributeReference]] that refer to
+ * the original alias should be updated to the new one.
+ *
  * @param child The computation being performed
  * @param name The name to be associated with the result of computing [[child]].
  * @param exprId A globally unique id used to check if an [[AttributeReference]] refers to this
  *               alias. Auto-assigned if left blank.
- * @param qualifier An optional string that can be used to referred to this attribute in a fully
- *                   qualified way. Consider the examples tableName.name, subQueryAlias.name.
- *                   tableName and subQueryAlias are possible qualifiers.
+ * @param qualifier An optional Seq of string that can be used to refer to this attribute in a
+ *                  fully qualified way. Consider the examples tableName.name, subQueryAlias.name.
+ *                  tableName and subQueryAlias are possible qualifiers.
  * @param explicitMetadata Explicit metadata associated with this alias that overwrites child's.
+ * @param nonInheritableMetadataKeys Keys of metadata entries that are supposed to be removed when
+ *                                   inheriting the metadata from the child.
  */
 case class Alias(child: Expression, name: String)(
     val exprId: ExprId = NamedExpression.newExprId,
-    val qualifier: Option[String] = None,
-    val explicitMetadata: Option[Metadata] = None)
+    val qualifier: Seq[String] = Seq.empty,
+    val explicitMetadata: Option[Metadata] = None,
+    val nonInheritableMetadataKeys: Seq[String] = Seq.empty)
   extends UnaryExpression with NamedExpression {
 
   // Alias(Generator, xx) need to be transformed into Generate(generator, ...)
@@ -141,7 +163,7 @@ case class Alias(child: Expression, name: String)(
   /** Just a simple passthrough for code generation. */
   override def genCode(ctx: CodegenContext): ExprCode = child.genCode(ctx)
   override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
-    throw new IllegalStateException("Alias.doGenCode should not be called.")
+    throw QueryExecutionErrors.doGenCodeOfAliasShouldNotBeCalledError
   }
 
   override def dataType: DataType = child.dataType
@@ -149,14 +171,21 @@ case class Alias(child: Expression, name: String)(
   override def metadata: Metadata = {
     explicitMetadata.getOrElse {
       child match {
-        case named: NamedExpression => named.metadata
+        case named: NamedExpression =>
+          val builder = new MetadataBuilder().withMetadata(named.metadata)
+          nonInheritableMetadataKeys.foreach(builder.remove)
+          builder.build()
+
         case _ => Metadata.empty
       }
     }
   }
 
   def newInstance(): NamedExpression =
-    Alias(child, name)(qualifier = qualifier, explicitMetadata = explicitMetadata)
+    Alias(child, name)(
+      qualifier = qualifier,
+      explicitMetadata = explicitMetadata,
+      nonInheritableMetadataKeys = nonInheritableMetadataKeys)
 
   override def toAttribute: Attribute = {
     if (resolved) {
@@ -176,7 +205,7 @@ case class Alias(child: Expression, name: String)(
   override def toString: String = s"$child AS $name#${exprId.id}$typeSuffix$delaySuffix"
 
   override protected final def otherCopyArgs: Seq[AnyRef] = {
-    exprId :: qualifier :: explicitMetadata :: Nil
+    exprId :: qualifier :: explicitMetadata :: nonInheritableMetadataKeys :: Nil
   }
 
   override def hashCode(): Int = {
@@ -187,13 +216,15 @@ case class Alias(child: Expression, name: String)(
   override def equals(other: Any): Boolean = other match {
     case a: Alias =>
       name == a.name && exprId == a.exprId && child == a.child && qualifier == a.qualifier &&
-        explicitMetadata == a.explicitMetadata
+        explicitMetadata == a.explicitMetadata &&
+        nonInheritableMetadataKeys == a.nonInheritableMetadataKeys
     case _ => false
   }
 
   override def sql: String = {
-    val qualifierPrefix = qualifier.map(_ + ".").getOrElse("")
-    s"${child.sql} AS $qualifierPrefix${quoteIdentifier(name)}"
+    val qualifierPrefix =
+      if (qualifier.nonEmpty) qualifier.map(quoteIfNeeded).mkString(".") + "." else ""
+    s"${child.sql} AS $qualifierPrefix${quoteIfNeeded(name)}"
   }
 }
 
@@ -216,7 +247,7 @@ case class AttributeReference(
     nullable: Boolean = true,
     override val metadata: Metadata = Metadata.empty)(
     val exprId: ExprId = NamedExpression.newExprId,
-    val qualifier: Option[String] = None)
+    val qualifier: Seq[String] = Seq.empty[String])
   extends Attribute with Unevaluable {
 
   /**
@@ -277,7 +308,7 @@ case class AttributeReference(
   /**
    * Returns a copy of this [[AttributeReference]] with new qualifier.
    */
-  override def withQualifier(newQualifier: Option[String]): AttributeReference = {
+  override def withQualifier(newQualifier: Seq[String]): AttributeReference = {
     if (newQualifier == qualifier) {
       this
     } else {
@@ -285,7 +316,7 @@ case class AttributeReference(
     }
   }
 
-  def withExprId(newExprId: ExprId): AttributeReference = {
+  override def withExprId(newExprId: ExprId): AttributeReference = {
     if (exprId == newExprId) {
       this
     } else {
@@ -293,7 +324,7 @@ case class AttributeReference(
     }
   }
 
-  override def withMetadata(newMetadata: Metadata): Attribute = {
+  override def withMetadata(newMetadata: Metadata): AttributeReference = {
     AttributeReference(name, dataType, nullable, newMetadata)(exprId, qualifier)
   }
 
@@ -312,11 +343,14 @@ case class AttributeReference(
 
   // Since the expression id is not in the first constructor it is missing from the default
   // tree string.
-  override def simpleString: String = s"$name#${exprId.id}: ${dataType.simpleString}"
+  override def simpleString(maxFields: Int): String = {
+    s"$name#${exprId.id}: ${dataType.simpleString(maxFields)}"
+  }
 
   override def sql: String = {
-    val qualifierPrefix = qualifier.map(_ + ".").getOrElse("")
-    s"$qualifierPrefix${quoteIdentifier(name)}"
+    val qualifierPrefix =
+      if (qualifier.nonEmpty) qualifier.map(quoteIfNeeded).mkString(".") + "." else ""
+    s"$qualifierPrefix${quoteIfNeeded(name)}"
   }
 }
 
@@ -341,13 +375,15 @@ case class PrettyAttribute(
   override def withNullability(newNullability: Boolean): Attribute =
     throw new UnsupportedOperationException
   override def newInstance(): Attribute = throw new UnsupportedOperationException
-  override def withQualifier(newQualifier: Option[String]): Attribute =
+  override def withQualifier(newQualifier: Seq[String]): Attribute =
     throw new UnsupportedOperationException
   override def withName(newName: String): Attribute = throw new UnsupportedOperationException
   override def withMetadata(newMetadata: Metadata): Attribute =
     throw new UnsupportedOperationException
-  override def qualifier: Option[String] = throw new UnsupportedOperationException
+  override def qualifier: Seq[String] = throw new UnsupportedOperationException
   override def exprId: ExprId = throw new UnsupportedOperationException
+  override def withExprId(newExprId: ExprId): Attribute =
+    throw new UnsupportedOperationException
   override def nullable: Boolean = true
 }
 
@@ -361,8 +397,9 @@ case class OuterReference(e: NamedExpression)
   override def nullable: Boolean = e.nullable
   override def prettyName: String = "outer"
 
+  override def sql: String = s"$prettyName(${e.sql})"
   override def name: String = e.name
-  override def qualifier: Option[String] = e.qualifier
+  override def qualifier: Seq[String] = e.qualifier
   override def exprId: ExprId = e.exprId
   override def toAttribute: Attribute = e.toAttribute
   override def newInstance(): NamedExpression = OuterReference(e.newInstance())

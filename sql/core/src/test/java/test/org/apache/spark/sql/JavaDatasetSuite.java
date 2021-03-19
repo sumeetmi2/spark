@@ -21,7 +21,12 @@ import java.io.Serializable;
 import java.math.BigDecimal;
 import java.sql.Date;
 import java.sql.Timestamp;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.Period;
 import java.util.*;
+import javax.annotation.Nonnull;
 
 import org.apache.spark.sql.streaming.GroupStateTimeout;
 import org.apache.spark.sql.streaming.OutputMode;
@@ -32,8 +37,8 @@ import scala.Tuple5;
 
 import com.google.common.base.Objects;
 import org.junit.*;
-import org.junit.rules.ExpectedException;
 
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.*;
 import org.apache.spark.sql.*;
@@ -337,6 +342,23 @@ public class JavaDatasetSuite implements Serializable {
   }
 
   @Test
+  public void testTupleEncoderSchema() {
+    Encoder<Tuple2<String, Tuple2<String,String>>> encoder =
+      Encoders.tuple(Encoders.STRING(), Encoders.tuple(Encoders.STRING(), Encoders.STRING()));
+    List<Tuple2<String, Tuple2<String, String>>> data = Arrays.asList(tuple2("1", tuple2("a", "b")),
+      tuple2("2", tuple2("c", "d")));
+    Dataset<Row> ds1 = spark.createDataset(data, encoder).toDF("value1", "value2");
+
+    JavaPairRDD<String, Tuple2<String, String>> pairRDD = jsc.parallelizePairs(data);
+    Dataset<Row> ds2 = spark.createDataset(JavaPairRDD.toRDD(pairRDD), encoder)
+      .toDF("value1", "value2");
+
+    Assert.assertEquals(ds1.schema(), ds2.schema());
+    Assert.assertEquals(ds1.select(expr("value2._1")).collectAsList(),
+      ds2.select(expr("value2._1")).collectAsList());
+  }
+
+  @Test
   public void testNestedTupleEncoder() {
     // test ((int, string), string)
     Encoder<Tuple2<Tuple2<Integer, String>, String>> encoder =
@@ -378,6 +400,32 @@ public class JavaDatasetSuite implements Serializable {
           Date.valueOf("1970-01-01"), new Timestamp(System.currentTimeMillis()), Float.MAX_VALUE));
     Dataset<Tuple5<Double, BigDecimal, Date, Timestamp, Float>> ds =
       spark.createDataset(data, encoder);
+    Assert.assertEquals(data, ds.collectAsList());
+  }
+
+  @Test
+  public void testLocalDateAndInstantEncoders() {
+    Encoder<Tuple2<LocalDate, Instant>> encoder =
+      Encoders.tuple(Encoders.LOCALDATE(), Encoders.INSTANT());
+    List<Tuple2<LocalDate, Instant>> data =
+      Arrays.asList(new Tuple2<>(LocalDate.ofEpochDay(0), Instant.ofEpochSecond(0)));
+    Dataset<Tuple2<LocalDate, Instant>> ds = spark.createDataset(data, encoder);
+    Assert.assertEquals(data, ds.collectAsList());
+  }
+
+  @Test
+  public void testDurationEncoder() {
+    Encoder<Duration> encoder = Encoders.DURATION();
+    List<Duration> data = Arrays.asList(Duration.ofDays(0));
+    Dataset<Duration> ds = spark.createDataset(data, encoder);
+    Assert.assertEquals(data, ds.collectAsList());
+  }
+
+  @Test
+  public void testPeriodEncoder() {
+    Encoder<Period> encoder = Encoders.PERIOD();
+    List<Period> data = Arrays.asList(Period.ofYears(10));
+    Dataset<Period> ds = spark.createDataset(data, encoder);
     Assert.assertEquals(data, ds.collectAsList());
   }
 
@@ -793,8 +841,74 @@ public class JavaDatasetSuite implements Serializable {
     }
   }
 
-  @Rule
-  public transient ExpectedException nullabilityCheck = ExpectedException.none();
+  public static class NestedSmallBeanWithNonNullField implements Serializable {
+    private SmallBean nonNull_f;
+    private SmallBean nullable_f;
+    private Map<String, SmallBean> childMap;
+
+    @Nonnull
+    public SmallBean getNonNull_f() {
+      return nonNull_f;
+    }
+
+    public void setNonNull_f(SmallBean f) {
+      this.nonNull_f = f;
+    }
+
+    public SmallBean getNullable_f() {
+      return nullable_f;
+    }
+
+    public void setNullable_f(SmallBean f) {
+      this.nullable_f = f;
+    }
+
+    @Nonnull
+    public Map<String, SmallBean> getChildMap() { return childMap; }
+    public void setChildMap(Map<String, SmallBean> childMap) {
+      this.childMap = childMap;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      NestedSmallBeanWithNonNullField that = (NestedSmallBeanWithNonNullField) o;
+      return Objects.equal(nullable_f, that.nullable_f) &&
+        Objects.equal(nonNull_f, that.nonNull_f) && Objects.equal(childMap, that.childMap);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(nullable_f, nonNull_f, childMap);
+    }
+  }
+
+  public static class NestedSmallBean2 implements Serializable {
+    private NestedSmallBeanWithNonNullField f;
+
+    @Nonnull
+    public NestedSmallBeanWithNonNullField getF() {
+      return f;
+    }
+
+    public void setF(NestedSmallBeanWithNonNullField f) {
+      this.f = f;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) return true;
+      if (o == null || getClass() != o.getClass()) return false;
+      NestedSmallBean2 that = (NestedSmallBean2) o;
+      return Objects.equal(f, that.f);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hashCode(f);
+    }
+  }
 
   @Test
   public void testRuntimeNullabilityCheck() {
@@ -823,7 +937,7 @@ public class JavaDatasetSuite implements Serializable {
       NestedSmallBean nestedSmallBean = new NestedSmallBean();
       nestedSmallBean.setF(smallBean);
 
-      Assert.assertEquals(ds.collectAsList(), Collections.singletonList(nestedSmallBean));
+      Assert.assertEquals(Collections.singletonList(nestedSmallBean), ds.collectAsList());
     }
 
     // Shouldn't throw runtime exception when parent object (`ClassData`) is null
@@ -834,11 +948,8 @@ public class JavaDatasetSuite implements Serializable {
       Dataset<NestedSmallBean> ds = df.as(Encoders.bean(NestedSmallBean.class));
 
       NestedSmallBean nestedSmallBean = new NestedSmallBean();
-      Assert.assertEquals(ds.collectAsList(), Collections.singletonList(nestedSmallBean));
+      Assert.assertEquals(Collections.singletonList(nestedSmallBean), ds.collectAsList());
     }
-
-    nullabilityCheck.expect(RuntimeException.class);
-    nullabilityCheck.expectMessage("Null value appeared in non-nullable field");
 
     {
       Row row = new GenericRow(new Object[] {
@@ -850,7 +961,8 @@ public class JavaDatasetSuite implements Serializable {
       Dataset<Row> df = spark.createDataFrame(Collections.singletonList(row), schema);
       Dataset<NestedSmallBean> ds = df.as(Encoders.bean(NestedSmallBean.class));
 
-      ds.collect();
+      Assert.assertThrows("Null value appeared in non-nullable field", RuntimeException.class,
+        ds::collect);
     }
   }
 
@@ -1354,7 +1466,7 @@ public class JavaDatasetSuite implements Serializable {
             new BeanWithEnum(MyEnum.B, "flower boulevard"));
     Encoder<BeanWithEnum> encoder = Encoders.bean(BeanWithEnum.class);
     Dataset<BeanWithEnum> ds = spark.createDataset(data, encoder);
-    Assert.assertEquals(ds.collectAsList(), data);
+    Assert.assertEquals(data, ds.collectAsList());
   }
 
   public static class EmptyBean implements Serializable {}
@@ -1364,8 +1476,8 @@ public class JavaDatasetSuite implements Serializable {
     EmptyBean bean = new EmptyBean();
     List<EmptyBean> data = Arrays.asList(bean);
     Dataset<EmptyBean> df = spark.createDataset(data, Encoders.bean(EmptyBean.class));
-    Assert.assertEquals(df.schema().length(), 0);
-    Assert.assertEquals(df.collectAsList().size(), 1);
+    Assert.assertEquals(0, df.schema().length());
+    Assert.assertEquals(1, df.collectAsList().size());
   }
 
   public class CircularReference1Bean implements Serializable {
@@ -1472,6 +1584,54 @@ public class JavaDatasetSuite implements Serializable {
     Dataset<NestedSmallBean> ds2 =
       ds1.map((MapFunction<NestedSmallBean, NestedSmallBean>) b -> b, encoder);
     Assert.assertEquals(beans, ds2.collectAsList());
+  }
+
+  @Test
+  public void testNonNullField() {
+    NestedSmallBeanWithNonNullField bean1 = new NestedSmallBeanWithNonNullField();
+    SmallBean smallBean = new SmallBean();
+    bean1.setNonNull_f(smallBean);
+    Map<String, SmallBean> map = new HashMap<>();
+    bean1.setChildMap(map);
+
+    Encoder<NestedSmallBeanWithNonNullField> encoder1 =
+            Encoders.bean(NestedSmallBeanWithNonNullField.class);
+    List<NestedSmallBeanWithNonNullField> beans1 = Arrays.asList(bean1);
+    Dataset<NestedSmallBeanWithNonNullField> ds1 = spark.createDataset(beans1, encoder1);
+
+    StructType schema = ds1.schema();
+    Assert.assertFalse(schema.apply("nonNull_f").nullable());
+    Assert.assertTrue(schema.apply("nullable_f").nullable());
+    Assert.assertFalse(schema.apply("childMap").nullable());
+
+    Assert.assertEquals(beans1, ds1.collectAsList());
+    Dataset<NestedSmallBeanWithNonNullField> ds2 = ds1.map(
+      (MapFunction<NestedSmallBeanWithNonNullField, NestedSmallBeanWithNonNullField>) b -> b,
+      encoder1);
+    Assert.assertEquals(beans1, ds2.collectAsList());
+
+    // Nonnull nested fields
+    NestedSmallBean2 bean2 = new NestedSmallBean2();
+    bean2.setF(bean1);
+
+    Encoder<NestedSmallBean2> encoder2 =
+            Encoders.bean(NestedSmallBean2.class);
+    List<NestedSmallBean2> beans2 = Arrays.asList(bean2);
+    Dataset<NestedSmallBean2> ds3 = spark.createDataset(beans2, encoder2);
+
+    StructType nestedSchema = (StructType) ds3.schema()
+      .fields()[ds3.schema().fieldIndex("f")]
+      .dataType();
+    Assert.assertFalse(nestedSchema.apply("nonNull_f").nullable());
+    Assert.assertTrue(nestedSchema.apply("nullable_f").nullable());
+    Assert.assertFalse(nestedSchema.apply("childMap").nullable());
+
+    Assert.assertEquals(beans2, ds3.collectAsList());
+
+    Dataset<NestedSmallBean2> ds4 = ds3.map(
+      (MapFunction<NestedSmallBean2, NestedSmallBean2>) b -> b,
+      encoder2);
+    Assert.assertEquals(beans2, ds4.collectAsList());
   }
 
   @Test

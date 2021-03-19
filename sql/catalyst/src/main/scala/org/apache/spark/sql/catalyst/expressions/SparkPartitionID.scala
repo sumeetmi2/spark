@@ -19,13 +19,21 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode, FalseLiteral}
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.types.{DataType, IntegerType}
 
 /**
  * Expression that returns the current partition id.
  */
 @ExpressionDescription(
-  usage = "_FUNC_() - Returns the current partition id.")
+  usage = "_FUNC_() - Returns the current partition id.",
+  examples = """
+    Examples:
+      > SELECT _FUNC_();
+       0
+  """,
+  since = "1.4.0",
+  group = "misc_funcs")
 case class SparkPartitionID() extends LeafExpression with Nondeterministic {
 
   override def nullable: Boolean = false
@@ -46,7 +54,7 @@ case class SparkPartitionID() extends LeafExpression with Nondeterministic {
     val idTerm = "partitionId"
     ctx.addImmutableStateIfNotExists(CodeGenerator.JAVA_INT, idTerm)
     ctx.addPartitionInitializationStatement(s"$idTerm = partitionIndex;")
-    ev.copy(code = s"final ${CodeGenerator.javaType(dataType)} ${ev.value} = $idTerm;",
+    ev.copy(code = code"final ${CodeGenerator.javaType(dataType)} ${ev.value} = $idTerm;",
       isNull = FalseLiteral)
   }
 }

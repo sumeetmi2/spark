@@ -17,8 +17,6 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
-import java.io.FileNotFoundException
-
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
@@ -91,9 +89,14 @@ class ParquetCommitterSuite extends SparkFunSuite with SQLTestUtils
       summary: Boolean,
       check: Boolean): Option[FileStatus] = {
     var result: Option[FileStatus] = None
+    val summaryLevel = if (summary) {
+      "ALL"
+    } else {
+      "NONE"
+    }
     withSQLConf(
       SQLConf.PARQUET_OUTPUT_COMMITTER_CLASS.key -> committer,
-      ParquetOutputFormat.ENABLE_JOB_SUMMARY -> summary.toString) {
+      ParquetOutputFormat.JOB_SUMMARY_LEVEL -> summaryLevel) {
         withTempPath { dest =>
           val df = spark.createDataFrame(Seq((1, "4"), (2, "2")))
           val destPath = new Path(dest.toURI)
@@ -144,7 +147,7 @@ private object MarkingFileOutput {
    * @param outputPath destination directory
    * @param conf configuration to create the FS with
    * @return the status of the marker
-   * @throws FileNotFoundException if the marker is absent
+   * @throws java.io.FileNotFoundException if the marker is absent
    */
   def checkMarker(outputPath: Path, conf: Configuration): FileStatus = {
     outputPath.getFileSystem(conf).getFileStatus(new Path(outputPath, "marker"))

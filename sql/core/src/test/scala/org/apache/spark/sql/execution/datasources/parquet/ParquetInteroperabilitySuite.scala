@@ -18,19 +18,19 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import java.io.File
+import java.time.ZoneOffset
 
 import org.apache.commons.io.FileUtils
-import org.apache.hadoop.fs.{FileSystem, Path, PathFilter}
+import org.apache.hadoop.fs.{Path, PathFilter}
 import org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER
-import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 
-class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedSQLContext {
+class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedSparkSession {
   test("parquet files with different physical schemas but share the same logical schema") {
     import ParquetCompatibilityTest._
 
@@ -123,12 +123,11 @@ class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedS
       FileUtils.copyFile(new File(impalaPath), new File(tableDir, "part-00001.parq"))
 
       Seq(false, true).foreach { int96TimestampConversion =>
-        Seq(false, true).foreach { vectorized =>
+        withAllParquetReaders {
           withSQLConf(
               (SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key,
                 SQLConf.ParquetOutputTimestampType.INT96.toString),
-              (SQLConf.PARQUET_INT96_TIMESTAMP_CONVERSION.key, int96TimestampConversion.toString()),
-              (SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key, vectorized.toString())
+              (SQLConf.PARQUET_INT96_TIMESTAMP_CONVERSION.key, int96TimestampConversion.toString())
           ) {
             val readBack = spark.read.parquet(tableDir.getAbsolutePath).collect()
             assert(readBack.size === 6)
@@ -141,14 +140,15 @@ class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedS
               impalaFileData.map { ts =>
                 DateTimeUtils.toJavaTimestamp(DateTimeUtils.convertTz(
                   DateTimeUtils.fromJavaTimestamp(ts),
-                  DateTimeUtils.TimeZoneUTC,
-                  DateTimeUtils.getTimeZone(conf.sessionLocalTimeZone)))
+                  ZoneOffset.UTC,
+                  DateTimeUtils.getZoneId(conf.sessionLocalTimeZone)))
               }
             }
             val fullExpectations = (ts ++ impalaExpectations).map(_.toString).sorted.toArray
             val actual = readBack.map(_.getTimestamp(0).toString).sorted
             withClue(
-              s"int96TimestampConversion = $int96TimestampConversion; vectorized = $vectorized") {
+              s"int96TimestampConversion = $int96TimestampConversion; " +
+              s"vectorized = ${SQLConf.get.parquetVectorizedReaderEnabled}") {
               assert(fullExpectations === actual)
 
               // Now test that the behavior is still correct even with a filter which could get
@@ -164,7 +164,7 @@ class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedS
               // the assumption on column stats, and also the end-to-end behavior.
 
               val hadoopConf = spark.sessionState.newHadoopConf()
-              val fs = FileSystem.get(hadoopConf)
+              val fs = new Path(tableDir.getAbsolutePath).getFileSystem(hadoopConf)
               val parts = fs.listStatus(new Path(tableDir.getAbsolutePath), new PathFilter {
                 override def accept(path: Path): Boolean = !path.getName.startsWith("_")
               })
@@ -173,18 +173,18 @@ class ParquetInteroperabilitySuite extends ParquetCompatibilityTest with SharedS
               assert(parts.size == 2)
               parts.foreach { part =>
                 val oneFooter =
-                  ParquetFileReader.readFooter(hadoopConf, part.getPath, NO_FILTER)
+                  ParquetFooterReader.readFooter(hadoopConf, part.getPath, NO_FILTER)
                 assert(oneFooter.getFileMetaData.getSchema.getColumns.size === 1)
-                assert(oneFooter.getFileMetaData.getSchema.getColumns.get(0).getType() ===
-                  PrimitiveTypeName.INT96)
+                val typeName = oneFooter
+                  .getFileMetaData.getSchema.getColumns.get(0).getPrimitiveType.getPrimitiveTypeName
+                assert(typeName === PrimitiveTypeName.INT96)
                 val oneBlockMeta = oneFooter.getBlocks().get(0)
                 val oneBlockColumnMeta = oneBlockMeta.getColumns().get(0)
-                val columnStats = oneBlockColumnMeta.getStatistics
                 // This is the important assert.  Column stats are written, but they are ignored
                 // when the data is read back as mentioned above, b/c int96 is unsigned.  This
-                // assert makes sure this holds even if we change parquet versions (if eg. there
+                // assert makes sure this holds even if we change parquet versions (if e.g. there
                 // were ever statistics even on unsigned columns).
-                assert(!columnStats.hasNonNullValue)
+                assert(!oneBlockColumnMeta.getStatistics.hasNonNullValue)
               }
 
               // These queries should return the entire dataset with the conversion applied,

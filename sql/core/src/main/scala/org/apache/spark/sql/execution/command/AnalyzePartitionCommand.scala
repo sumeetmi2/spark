@@ -20,10 +20,10 @@ package org.apache.spark.sql.execution.command
 import org.apache.spark.sql.{AnalysisException, Column, Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.{NoSuchPartitionException, UnresolvedAttribute}
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType}
+import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, ExternalCatalogUtils}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.{And, EqualTo, Literal}
-import org.apache.spark.sql.execution.datasources.PartitioningUtils
+import org.apache.spark.sql.util.PartitioningUtils
 
 /**
  * Analyzes a given set of partitions to generate per-partition statistics, which will be used in
@@ -47,7 +47,7 @@ case class AnalyzePartitionCommand(
 
   private def getPartitionSpec(table: CatalogTable): Option[TablePartitionSpec] = {
     val normalizedPartitionSpec =
-      PartitioningUtils.normalizePartitionSpec(partitionSpec, table.partitionColumnNames,
+      PartitioningUtils.normalizePartitionSpec(partitionSpec, table.partitionSchema,
         table.identifier.quotedString, conf.resolver)
 
     // Report an error if partition columns in partition specification do not form
@@ -69,7 +69,7 @@ case class AnalyzePartitionCommand(
     if (filteredSpec.isEmpty) {
       None
     } else {
-      Some(filteredSpec)
+      Some(filteredSpec.toMap)
     }
   }
 
@@ -106,11 +106,12 @@ case class AnalyzePartitionCommand(
 
     // Update the metastore if newly computed statistics are different from those
     // recorded in the metastore.
-    val newPartitions = partitions.flatMap { p =>
-      val newTotalSize = CommandUtils.calculateLocationSize(
-        sessionState, tableMeta.identifier, p.storage.locationUri)
+
+    val sizes = CommandUtils.calculateMultipleLocationSizes(sparkSession, tableMeta.identifier,
+      partitions.map(_.storage.locationUri))
+    val newPartitions = partitions.zipWithIndex.flatMap { case (p, idx) =>
       val newRowCount = rowCounts.get(p.spec)
-      val newStats = CommandUtils.compareAndGetNewStats(tableMeta.stats, newTotalSize, newRowCount)
+      val newStats = CommandUtils.compareAndGetNewStats(p.stats, sizes(idx), newRowCount)
       newStats.map(_ => p.copy(stats = newStats))
     }
 
@@ -140,7 +141,13 @@ case class AnalyzePartitionCommand(
     val df = tableDf.filter(Column(filter)).groupBy(partitionColumns: _*).count()
 
     df.collect().map { r =>
-      val partitionColumnValues = partitionColumns.indices.map(r.get(_).toString)
+      val partitionColumnValues = partitionColumns.indices.map { i =>
+        if (r.isNullAt(i)) {
+          ExternalCatalogUtils.DEFAULT_PARTITION_NAME
+        } else {
+          r.get(i).toString
+        }
+      }
       val spec = tableMeta.partitionColumnNames.zip(partitionColumnValues).toMap
       val count = BigInt(r.getLong(partitionColumns.size))
       (spec, count)
